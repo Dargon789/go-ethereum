@@ -18,6 +18,13 @@ jobs:
     - name: Install autoconf dependencies
       run: sudo apt-get update && sudo apt-get install -y autoconf
       
+    - name: Verify configure.ac existence
+      run: |
+         if [ ! -f configure.ac ]; then
+      if: Missing configure.ac file. Please add it to the repository."
+          exit 1
+          fi
+
     - name: Generate configure script
       run: autoreconf --install
 
