@@ -31,7 +31,6 @@ jobs:
         go run build/ci.go lint
         go run build/ci.go check_generate
         go run build/ci.go check_baddeps
-
   build:
     runs-on: self-hosted
     steps:
