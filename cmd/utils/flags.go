@@ -111,6 +111,11 @@ var (
 		Usage:    "Root directory for ancient data (default = inside chaindata)",
 		Category: flags.EthCategory,
 	}
+	EraFlag = &flags.DirectoryFlag{
+		Name:     "datadir.era",
+		Usage:    "Root directory for era1 history (default = inside ancient/chain)",
+		Category: flags.EthCategory,
+	}
 	MinFreeDiskSpaceFlag = &flags.DirectoryFlag{
 		Name:     "datadir.minfreedisk",
 		Usage:    "Minimum free disk space in MB, once reached triggers auto shut down (default = --cache.gc converted to MB, 0 = disabled)",
@@ -145,7 +150,7 @@ var (
 	}
 	SepoliaFlag = &cli.BoolFlag{
 		Name:     "sepolia",
-		Usage:    "Sepolia network: pre-configured proof-of-work test network",
+		Usage:    "Sepolia network: pre-configured proof-of-stake test network",
 		Category: flags.EthCategory,
 	}
 	HoleskyFlag = &cli.BoolFlag{
@@ -977,6 +982,7 @@ var (
 	DatabaseFlags = []cli.Flag{
 		DataDirFlag,
 		AncientFlag,
+		EraFlag,
 		RemoteDBFlag,
 		DBEngineFlag,
 		StateSchemeFlag,
@@ -1613,6 +1619,9 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	if ctx.IsSet(AncientFlag.Name) {
 		cfg.DatabaseFreezer = ctx.String(AncientFlag.Name)
 	}
+	if ctx.IsSet(EraFlag.Name) {
+		cfg.DatabaseEra = ctx.String(EraFlag.Name)
+	}
 
 	if gcmode := ctx.String(GCModeFlag.Name); gcmode != "full" && gcmode != "archive" {
 		Fatalf("--%s must be either 'full' or 'archive'", GCModeFlag.Name)
@@ -2082,7 +2091,15 @@ func MakeChainDatabase(ctx *cli.Context, stack *node.Node, readonly bool) ethdb.
 		}
 		chainDb = remotedb.New(client)
 	default:
-		chainDb, err = stack.OpenDatabaseWithFreezer("chaindata", cache, handles, ctx.String(AncientFlag.Name), "eth/db/chaindata/", readonly)
+		options := node.DatabaseOptions{
+			ReadOnly:          readonly,
+			Cache:             cache,
+			Handles:           handles,
+			AncientsDirectory: ctx.String(AncientFlag.Name),
+			MetricsNamespace:  "eth/db/chaindata/",
+			EraDirectory:      ctx.String(EraFlag.Name),
+		}
+		chainDb, err = stack.OpenDatabaseWithOptions("chaindata", options)
 	}
 	if err != nil {
 		Fatalf("Could not open database: %v", err)
@@ -2174,36 +2191,38 @@ func MakeChain(ctx *cli.Context, stack *node.Node, readonly bool) (*core.BlockCh
 	if err != nil {
 		Fatalf("%v", err)
 	}
-	cache := &core.CacheConfig{
-		TrieCleanLimit:      ethconfig.Defaults.TrieCleanCache,
-		TrieCleanNoPrefetch: ctx.Bool(CacheNoPrefetchFlag.Name),
-		TrieDirtyLimit:      ethconfig.Defaults.TrieDirtyCache,
-		TrieDirtyDisabled:   ctx.String(GCModeFlag.Name) == "archive",
-		TrieTimeLimit:       ethconfig.Defaults.TrieTimeout,
-		SnapshotLimit:       ethconfig.Defaults.SnapshotCache,
-		Preimages:           ctx.Bool(CachePreimagesFlag.Name),
-		StateScheme:         scheme,
-		StateHistory:        ctx.Uint64(StateHistoryFlag.Name),
+	options := &core.BlockChainConfig{
+		TrieCleanLimit: ethconfig.Defaults.TrieCleanCache,
+		NoPrefetch:     ctx.Bool(CacheNoPrefetchFlag.Name),
+		TrieDirtyLimit: ethconfig.Defaults.TrieDirtyCache,
+		ArchiveMode:    ctx.String(GCModeFlag.Name) == "archive",
+		TrieTimeLimit:  ethconfig.Defaults.TrieTimeout,
+		SnapshotLimit:  ethconfig.Defaults.SnapshotCache,
+		Preimages:      ctx.Bool(CachePreimagesFlag.Name),
+		StateScheme:    scheme,
+		StateHistory:   ctx.Uint64(StateHistoryFlag.Name),
+		// Disable transaction indexing/unindexing.
+		TxLookupLimit: -1,
 	}
-	if cache.TrieDirtyDisabled && !cache.Preimages {
-		cache.Preimages = true
+	if options.ArchiveMode && !options.Preimages {
+		options.Preimages = true
 		log.Info("Enabling recording of key preimages since archive mode is used")
 	}
 	if !ctx.Bool(SnapshotFlag.Name) {
-		cache.SnapshotLimit = 0 // Disabled
+		options.SnapshotLimit = 0 // Disabled
 	} else if ctx.IsSet(CacheFlag.Name) || ctx.IsSet(CacheSnapshotFlag.Name) {
-		cache.SnapshotLimit = ctx.Int(CacheFlag.Name) * ctx.Int(CacheSnapshotFlag.Name) / 100
+		options.SnapshotLimit = ctx.Int(CacheFlag.Name) * ctx.Int(CacheSnapshotFlag.Name) / 100
 	}
 	// If we're in readonly, do not bother generating snapshot data.
 	if readonly {
-		cache.SnapshotNoBuild = true
+		options.SnapshotNoBuild = true
 	}
 
 	if ctx.IsSet(CacheFlag.Name) || ctx.IsSet(CacheTrieFlag.Name) {
-		cache.TrieCleanLimit = ctx.Int(CacheFlag.Name) * ctx.Int(CacheTrieFlag.Name) / 100
+		options.TrieCleanLimit = ctx.Int(CacheFlag.Name) * ctx.Int(CacheTrieFlag.Name) / 100
 	}
 	if ctx.IsSet(CacheFlag.Name) || ctx.IsSet(CacheGCFlag.Name) {
-		cache.TrieDirtyLimit = ctx.Int(CacheFlag.Name) * ctx.Int(CacheGCFlag.Name) / 100
+		options.TrieDirtyLimit = ctx.Int(CacheFlag.Name) * ctx.Int(CacheGCFlag.Name) / 100
 	}
 	vmcfg := vm.Config{
 		EnablePreimageRecording: ctx.Bool(VMEnableDebugFlag.Name),
@@ -2218,8 +2237,9 @@ func MakeChain(ctx *cli.Context, stack *node.Node, readonly bool) (*core.BlockCh
 			vmcfg.Tracer = t
 		}
 	}
-	// Disable transaction indexing/unindexing by default.
-	chain, err := core.NewBlockChain(chainDb, cache, gspec, nil, engine, vmcfg, nil)
+	options.VmConfig = vmcfg
+
+	chain, err := core.NewBlockChain(chainDb, gspec, engine, options)
 	if err != nil {
 		Fatalf("Can't create BlockChain: %v", err)
 	}
