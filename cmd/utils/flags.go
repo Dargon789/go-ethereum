@@ -243,9 +243,9 @@ var (
 		Value:    2048,
 		Category: flags.EthCategory,
 	}
-	OverridePrague = &cli.Uint64Flag{
-		Name:     "override.prague",
-		Usage:    "Manually specify the Prague fork timestamp, overriding the bundled setting",
+	OverrideOsaka = &cli.Uint64Flag{
+		Name:     "override.osaka",
+		Usage:    "Manually specify the Osaka fork timestamp, overriding the bundled setting",
 		Category: flags.EthCategory,
 	}
 	OverrideVerkle = &cli.Uint64Flag{
@@ -261,7 +261,7 @@ var (
 	}
 	GCModeFlag = &cli.StringFlag{
 		Name:     "gcmode",
-		Usage:    `Blockchain garbage collection mode, only relevant in state.scheme=hash ("full", "archive")`,
+		Usage:    `Blockchain garbage collection mode ("full", "archive")`,
 		Value:    "full",
 		Category: flags.StateCategory,
 	}
@@ -1379,13 +1379,13 @@ func SetNodeConfig(ctx *cli.Context, cfg *node.Config) {
 		cfg.UseLightweightKDF = ctx.Bool(LightKDFFlag.Name)
 	}
 	if ctx.IsSet(NoUSBFlag.Name) || cfg.NoUSB {
-		log.Warn("Option nousb is deprecated and USB is deactivated by default. Use --usb to enable")
+		log.Warn("Option --nousb is deprecated and USB is deactivated by default. Use --usb to enable")
 	}
 	if ctx.IsSet(USBFlag.Name) {
 		cfg.USB = ctx.Bool(USBFlag.Name)
 	}
 	if ctx.IsSet(InsecureUnlockAllowedFlag.Name) {
-		log.Warn(fmt.Sprintf("Option %q is deprecated and has no effect", InsecureUnlockAllowedFlag.Name))
+		log.Warn(fmt.Sprintf("Option --%s is deprecated and has no effect", InsecureUnlockAllowedFlag.Name))
 	}
 	if ctx.IsSet(DBEngineFlag.Name) {
 		dbEngine := ctx.String(DBEngineFlag.Name)
@@ -1397,10 +1397,10 @@ func SetNodeConfig(ctx *cli.Context, cfg *node.Config) {
 	}
 	// deprecation notice for log debug flags (TODO: find a more appropriate place to put these?)
 	if ctx.IsSet(LogBacktraceAtFlag.Name) {
-		log.Warn("log.backtrace flag is deprecated")
+		log.Warn("Option --log.backtrace flag is deprecated")
 	}
 	if ctx.IsSet(LogDebugFlag.Name) {
-		log.Warn("log.debug flag is deprecated")
+		log.Warn("Option --log.debug flag is deprecated")
 	}
 }
 
@@ -1661,11 +1661,6 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 			cfg.TransactionHistory = 0
 			log.Warn("Disabled transaction unindexing for archive node")
 		}
-
-		if cfg.StateScheme != rawdb.HashScheme {
-			cfg.StateScheme = rawdb.HashScheme
-			log.Warn("Forcing hash state-scheme for archive mode")
-		}
 	}
 	if ctx.IsSet(LogHistoryFlag.Name) {
 		cfg.LogHistory = ctx.Uint64(LogHistoryFlag.Name)
@@ -1896,11 +1891,11 @@ func MakeBeaconLightConfig(ctx *cli.Context) bparams.ClientConfig {
 		if c, err := hexutil.Decode(ctx.String(BeaconGenesisRootFlag.Name)); err == nil && len(c) <= 32 {
 			copy(config.GenesisValidatorsRoot[:len(c)], c)
 		} else {
-			Fatalf("Invalid hex string", "beacon.genesis.gvroot", ctx.String(BeaconGenesisRootFlag.Name), "error", err)
+			Fatalf("Could not parse --%s: %v", BeaconGenesisRootFlag.Name, err)
 		}
 		configFile := ctx.String(BeaconConfigFlag.Name)
 		if err := config.ChainConfig.LoadForks(configFile); err != nil {
-			Fatalf("Could not load beacon chain config", "file", configFile, "error", err)
+			Fatalf("Could not load beacon chain config '%s': %v", configFile, err)
 		}
 		log.Info("Using custom beacon chain config", "file", configFile)
 	} else {
@@ -1917,17 +1912,17 @@ func MakeBeaconLightConfig(ctx *cli.Context) bparams.ClientConfig {
 	// are saved to the specified file.
 	if ctx.IsSet(BeaconCheckpointFileFlag.Name) {
 		if _, err := config.SetCheckpointFile(ctx.String(BeaconCheckpointFileFlag.Name)); err != nil {
-			Fatalf("Could not load beacon checkpoint file", "beacon.checkpoint.file", ctx.String(BeaconCheckpointFileFlag.Name), "error", err)
+			Fatalf("Could not load beacon checkpoint file '%s': %v", ctx.String(BeaconCheckpointFileFlag.Name), err)
 		}
 	}
 	if ctx.IsSet(BeaconCheckpointFlag.Name) {
 		hex := ctx.String(BeaconCheckpointFlag.Name)
 		c, err := hexutil.Decode(hex)
 		if err != nil {
-			Fatalf("Invalid hex string", "beacon.checkpoint", hex, "error", err)
+			Fatalf("Could not parse --%s: %v", BeaconCheckpointFlag.Name, err)
 		}
 		if len(c) != 32 {
-			Fatalf("Invalid hex string length", "beacon.checkpoint", hex, "length", len(c))
+			Fatalf("Could not parse --%s: invalid length %d, want 32", BeaconCheckpointFlag.Name, len(c))
 		}
 		copy(config.Checkpoint[:len(c)], c)
 	}
