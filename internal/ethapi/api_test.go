@@ -34,11 +34,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ethereum/go-ethereum/accounts/abi"
-	"github.com/ethereum/go-ethereum/internal/ethapi/override"
-
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts"
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
@@ -56,6 +54,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/internal/blocktest"
+	"github.com/ethereum/go-ethereum/internal/ethapi/override"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/holiman/uint256"
@@ -2671,19 +2670,53 @@ func TestSendBlobTransaction(t *testing.T) {
 
 func TestFillBlobTransaction(t *testing.T) {
 	t.Parallel()
+
+	testFillBlobTransaction(t, false)
+	testFillBlobTransaction(t, true)
+}
+
+func testFillBlobTransaction(t *testing.T, osaka bool) {
 	// Initialize test accounts
+	config := *params.MergedTestChainConfig
+	if !osaka {
+		config.OsakaTime = nil
+	}
 	var (
 		key, _  = crypto.HexToECDSA("8a1f9a8f95be41cd7ccb6168179afb4504aefe388d1e14474d32c45c72ce7b7a")
 		to      = crypto.PubkeyToAddress(key.PublicKey)
 		genesis = &core.Genesis{
-			Config: params.MergedTestChainConfig,
+			Config: &config,
 			Alloc:  types.GenesisAlloc{},
 		}
-		emptyBlob                      = new(kzg4844.Blob)
-		emptyBlobs                     = []kzg4844.Blob{*emptyBlob}
-		emptyBlobCommit, _             = kzg4844.BlobToCommitment(emptyBlob)
-		emptyBlobProof, _              = kzg4844.ComputeBlobProof(emptyBlob, emptyBlobCommit)
-		emptyBlobHash      common.Hash = kzg4844.CalcBlobHashV1(sha256.New(), &emptyBlobCommit)
+		emptyBlob                          = new(kzg4844.Blob)
+		emptyBlobs                         = []kzg4844.Blob{*emptyBlob}
+		emptyBlobCommit, _                 = kzg4844.BlobToCommitment(emptyBlob)
+		emptyBlobProof, _                  = kzg4844.ComputeBlobProof(emptyBlob, emptyBlobCommit)
+		emptyBlobCellProofs, _             = kzg4844.ComputeCellProofs(emptyBlob)
+		emptyBlobHash          common.Hash = kzg4844.CalcBlobHashV1(sha256.New(), &emptyBlobCommit)
+
+		fillEmptyKZGProofs = func(blobs int) []kzg4844.Proof {
+			if osaka {
+				return make([]kzg4844.Proof, blobs*kzg4844.CellProofsPerBlob)
+			}
+			return make([]kzg4844.Proof, blobs)
+		}
+		expectSidecar = func() *types.BlobTxSidecar {
+			if osaka {
+				return types.NewBlobTxSidecar(
+					types.BlobSidecarVersion1,
+					emptyBlobs,
+					[]kzg4844.Commitment{emptyBlobCommit},
+					emptyBlobCellProofs,
+				)
+			}
+			return types.NewBlobTxSidecar(
+				types.BlobSidecarVersion0,
+				emptyBlobs,
+				[]kzg4844.Commitment{emptyBlobCommit},
+				[]kzg4844.Proof{emptyBlobProof},
+			)
+		}
 	)
 	b := newTestBackend(t, 1, genesis, beacon.New(ethash.NewFaker()), func(i int, b *core.BlockGen) {
 		b.SetPoS()
@@ -2743,7 +2776,7 @@ func TestFillBlobTransaction(t *testing.T) {
 				Commitments: []kzg4844.Commitment{{}, {}},
 				Proofs:      []kzg4844.Proof{{}},
 			},
-			err: `number of blobs and proofs mismatch (have=1, want=2)`,
+			err: fmt.Sprintf(`number of blobs and proofs mismatch (have=1, want=%d)`, len(fillEmptyKZGProofs(2))),
 		},
 		{
 			name: "TestInvalidProofVerification",
@@ -2753,7 +2786,7 @@ func TestFillBlobTransaction(t *testing.T) {
 				Value:       (*hexutil.Big)(big.NewInt(1)),
 				Blobs:       []kzg4844.Blob{{}, {}},
 				Commitments: []kzg4844.Commitment{{}, {}},
-				Proofs:      []kzg4844.Proof{{}, {}},
+				Proofs:      fillEmptyKZGProofs(2),
 			},
 			err: `failed to verify blob proof: short buffer`,
 		},
@@ -2769,7 +2802,7 @@ func TestFillBlobTransaction(t *testing.T) {
 			},
 			want: &result{
 				Hashes:  []common.Hash{emptyBlobHash},
-				Sidecar: types.NewBlobTxSidecar(types.BlobSidecarVersion0, emptyBlobs, []kzg4844.Commitment{emptyBlobCommit}, []kzg4844.Proof{emptyBlobProof}),
+				Sidecar: expectSidecar(),
 			},
 		},
 		{
@@ -2785,7 +2818,7 @@ func TestFillBlobTransaction(t *testing.T) {
 			},
 			want: &result{
 				Hashes:  []common.Hash{emptyBlobHash},
-				Sidecar: types.NewBlobTxSidecar(types.BlobSidecarVersion0, emptyBlobs, []kzg4844.Commitment{emptyBlobCommit}, []kzg4844.Proof{emptyBlobProof}),
+				Sidecar: expectSidecar(),
 			},
 		},
 		{
@@ -2811,7 +2844,7 @@ func TestFillBlobTransaction(t *testing.T) {
 			},
 			want: &result{
 				Hashes:  []common.Hash{emptyBlobHash},
-				Sidecar: types.NewBlobTxSidecar(types.BlobSidecarVersion0, emptyBlobs, []kzg4844.Commitment{emptyBlobCommit}, []kzg4844.Proof{emptyBlobProof}),
+				Sidecar: expectSidecar(),
 			},
 		},
 	}
@@ -3724,4 +3757,46 @@ func TestCreateAccessListWithStateOverrides(t *testing.T) {
 		StorageKeys: []common.Hash{{}},
 	}}
 	require.Equal(t, expected, result.Accesslist)
+}
+
+func TestEstimateGasWithMovePrecompile(t *testing.T) {
+	t.Parallel()
+	// Initialize test accounts
+	var (
+		accounts = newAccounts(2)
+		genesis  = &core.Genesis{
+			Config: params.MergedTestChainConfig,
+			Alloc: types.GenesisAlloc{
+				accounts[0].addr: {Balance: big.NewInt(params.Ether)},
+			},
+		}
+	)
+	backend := newTestBackend(t, 1, genesis, beacon.New(ethash.NewFaker()), func(i int, b *core.BlockGen) {
+		b.SetPoS()
+	})
+	api := NewBlockChainAPI(backend)
+	// Move SHA256 precompile (0x2) to a new address (0x100)
+	// and estimate gas for calling the moved precompile.
+	var (
+		sha256Addr    = common.BytesToAddress([]byte{0x2})
+		newSha256Addr = common.BytesToAddress([]byte{0x10, 0})
+		sha256Input   = hexutil.Bytes([]byte("hello"))
+		args          = TransactionArgs{
+			From: &accounts[0].addr,
+			To:   &newSha256Addr,
+			Data: &sha256Input,
+		}
+		overrides = &override.StateOverride{
+			sha256Addr: override.OverrideAccount{
+				MovePrecompileTo: &newSha256Addr,
+			},
+		}
+	)
+	gas, err := api.EstimateGas(context.Background(), args, nil, overrides, nil)
+	if err != nil {
+		t.Fatalf("EstimateGas failed: %v", err)
+	}
+	if gas != 21366 {
+		t.Fatalf("mismatched gas: %d, want 21366", gas)
+	}
 }
