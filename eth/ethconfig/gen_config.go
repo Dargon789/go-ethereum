@@ -44,11 +44,15 @@ func (c Config) MarshalTOML() (interface{}, error) {
 		SnapshotCache           int
 		Preimages               bool
 		FilterLogCacheSize      int
+		LogQueryLimit           int
 		Miner                   miner.Config
 		TxPool                  legacypool.Config
 		BlobPool                blobpool.Config
 		GPO                     gasprice.Config
 		EnablePreimageRecording bool
+		EnableWitnessStats      bool
+		StatelessSelfValidation bool
+		EnableStateSizeTracking bool
 		VMTrace                 string
 		VMTraceJsonConfig       string
 		RPCGasCap               uint64
@@ -85,11 +89,15 @@ func (c Config) MarshalTOML() (interface{}, error) {
 	enc.SnapshotCache = c.SnapshotCache
 	enc.Preimages = c.Preimages
 	enc.FilterLogCacheSize = c.FilterLogCacheSize
+	enc.LogQueryLimit = c.LogQueryLimit
 	enc.Miner = c.Miner
 	enc.TxPool = c.TxPool
 	enc.BlobPool = c.BlobPool
 	enc.GPO = c.GPO
 	enc.EnablePreimageRecording = c.EnablePreimageRecording
+	enc.EnableWitnessStats = c.EnableWitnessStats
+	enc.StatelessSelfValidation = c.StatelessSelfValidation
+	enc.EnableStateSizeTracking = c.EnableStateSizeTracking
 	enc.VMTrace = c.VMTrace
 	enc.VMTraceJsonConfig = c.VMTraceJsonConfig
 	enc.RPCGasCap = c.RPCGasCap
@@ -130,11 +138,15 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		SnapshotCache           *int
 		Preimages               *bool
 		FilterLogCacheSize      *int
+		LogQueryLimit           *int
 		Miner                   *miner.Config
 		TxPool                  *legacypool.Config
 		BlobPool                *blobpool.Config
 		GPO                     *gasprice.Config
 		EnablePreimageRecording *bool
+		EnableWitnessStats      *bool
+		StatelessSelfValidation *bool
+		EnableStateSizeTracking *bool
 		VMTrace                 *string
 		VMTraceJsonConfig       *string
 		RPCGasCap               *uint64
@@ -228,6 +240,9 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	if dec.FilterLogCacheSize != nil {
 		c.FilterLogCacheSize = *dec.FilterLogCacheSize
 	}
+	if dec.LogQueryLimit != nil {
+		c.LogQueryLimit = *dec.LogQueryLimit
+	}
 	if dec.Miner != nil {
 		c.Miner = *dec.Miner
 	}
@@ -242,6 +257,15 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	}
 	if dec.EnablePreimageRecording != nil {
 		c.EnablePreimageRecording = *dec.EnablePreimageRecording
+	}
+	if dec.EnableWitnessStats != nil {
+		c.EnableWitnessStats = *dec.EnableWitnessStats
+	}
+	if dec.StatelessSelfValidation != nil {
+		c.StatelessSelfValidation = *dec.StatelessSelfValidation
+	}
+	if dec.EnableStateSizeTracking != nil {
+		c.EnableStateSizeTracking = *dec.EnableStateSizeTracking
 	}
 	if dec.VMTrace != nil {
 		c.VMTrace = *dec.VMTrace
