@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"iter"
 	"maps"
 	"slices"
 	"time"
@@ -275,6 +276,36 @@ func newStateHistory(root common.Hash, parent common.Hash, block uint64, account
 	}
 }
 
+// typ implements the history interface, returning the historical data type held.
+func (h *stateHistory) typ() historyType {
+	return typeStateHistory
+}
+
+// forEach implements the history interface, returning an iterator to traverse the
+// state entries in the history.
+func (h *stateHistory) forEach() iter.Seq[stateIdent] {
+	return func(yield func(stateIdent) bool) {
+		for _, addr := range h.accountList {
+			addrHash := crypto.Keccak256Hash(addr.Bytes())
+			if !yield(newAccountIdent(addrHash)) {
+				return
+			}
+			for _, slotKey := range h.storageList[addr] {
+				// The hash of the storage slot key is used as the identifier because the
+				// legacy history does not include the raw storage key, therefore, the
+				// conversion from storage key to hash is necessary for non-v0 histories.
+				slotHash := slotKey
+				if h.meta.version != stateHistoryV0 {
+					slotHash = crypto.Keccak256Hash(slotKey.Bytes())
+				}
+				if !yield(newStorageIdent(addrHash, slotHash)) {
+					return
+				}
+			}
+		}
+	}
+}
+
 // stateSet returns the state set, keyed by the hash of the account address
 // and the hash of the storage slot key.
 func (h *stateHistory) stateSet() (map[common.Hash][]byte, map[common.Hash]map[common.Hash][]byte) {
@@ -504,6 +535,20 @@ func (h *stateHistory) decode(accountData, storageData, accountIndexes, storageI
 	return nil
 }
 
+// readStateHistoryMeta reads the metadata of state history with the specified id.
+func readStateHistoryMeta(reader ethdb.AncientReader, id uint64) (*meta, error) {
+	data := rawdb.ReadStateHistoryMeta(reader, id)
+	if len(data) == 0 {
+		return nil, fmt.Errorf("metadata is not found, %d", id)
+	}
+	var m meta
+	err := m.decode(data)
+	if err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
 // readStateHistory reads a single state history records with the specified id.
 func readStateHistory(reader ethdb.AncientReader, id uint64) (*stateHistory, error) {
 	mData, accountIndexes, storageIndexes, accountData, storageData, err := rawdb.ReadStateHistory(reader, id)
@@ -522,8 +567,8 @@ func readStateHistory(reader ethdb.AncientReader, id uint64) (*stateHistory, err
 }
 
 // readStateHistories reads a list of state history records within the specified range.
-func readStateHistories(freezer ethdb.AncientReader, start uint64, count uint64) ([]*stateHistory, error) {
-	var histories []*stateHistory
+func readStateHistories(freezer ethdb.AncientReader, start uint64, count uint64) ([]history, error) {
+	var histories []history
 	metaList, aIndexList, sIndexList, aDataList, sDataList, err := rawdb.ReadStateHistoryList(freezer, start, count)
 	if err != nil {
 		return nil, err
@@ -568,8 +613,8 @@ func writeStateHistory(writer ethdb.AncientWriter, dl *diffLayer) error {
 	return nil
 }
 
-// checkStateHistories retrieves a batch of meta objects with the specified range
-// and performs the callback on each item.
+// checkStateHistories retrieves a batch of metadata objects with the specified
+// range and performs the callback on each item.
 func checkStateHistories(reader ethdb.AncientReader, start, count uint64, check func(*meta) error) error {
 	for count > 0 {
 		number := count
@@ -593,88 +638,4 @@ func checkStateHistories(reader ethdb.AncientReader, start, count uint64, check 
 		start += uint64(len(blobs))
 	}
 	return nil
-}
-
-// truncateFromHead removes the extra state histories from the head with the given
-// parameters. It returns the number of items removed from the head.
-func truncateFromHead(db ethdb.Batcher, store ethdb.AncientStore, nhead uint64) (int, error) {
-	ohead, err := store.Ancients()
-	if err != nil {
-		return 0, err
-	}
-	otail, err := store.Tail()
-	if err != nil {
-		return 0, err
-	}
-	// Ensure that the truncation target falls within the specified range.
-	if ohead < nhead || nhead < otail {
-		return 0, fmt.Errorf("out of range, tail: %d, head: %d, target: %d", otail, ohead, nhead)
-	}
-	// Short circuit if nothing to truncate.
-	if ohead == nhead {
-		return 0, nil
-	}
-	// Load the meta objects in range [nhead+1, ohead]
-	blobs, err := rawdb.ReadStateHistoryMetaList(store, nhead+1, ohead-nhead)
-	if err != nil {
-		return 0, err
-	}
-	batch := db.NewBatch()
-	for _, blob := range blobs {
-		var m meta
-		if err := m.decode(blob); err != nil {
-			return 0, err
-		}
-		rawdb.DeleteStateID(batch, m.root)
-	}
-	if err := batch.Write(); err != nil {
-		return 0, err
-	}
-	ohead, err = store.TruncateHead(nhead)
-	if err != nil {
-		return 0, err
-	}
-	return int(ohead - nhead), nil
-}
-
-// truncateFromTail removes the extra state histories from the tail with the given
-// parameters. It returns the number of items removed from the tail.
-func truncateFromTail(db ethdb.Batcher, store ethdb.AncientStore, ntail uint64) (int, error) {
-	ohead, err := store.Ancients()
-	if err != nil {
-		return 0, err
-	}
-	otail, err := store.Tail()
-	if err != nil {
-		return 0, err
-	}
-	// Ensure that the truncation target falls within the specified range.
-	if otail > ntail || ntail > ohead {
-		return 0, fmt.Errorf("out of range, tail: %d, head: %d, target: %d", otail, ohead, ntail)
-	}
-	// Short circuit if nothing to truncate.
-	if otail == ntail {
-		return 0, nil
-	}
-	// Load the meta objects in range [otail+1, ntail]
-	blobs, err := rawdb.ReadStateHistoryMetaList(store, otail+1, ntail-otail)
-	if err != nil {
-		return 0, err
-	}
-	batch := db.NewBatch()
-	for _, blob := range blobs {
-		var m meta
-		if err := m.decode(blob); err != nil {
-			return 0, err
-		}
-		rawdb.DeleteStateID(batch, m.root)
-	}
-	if err := batch.Write(); err != nil {
-		return 0, err
-	}
-	otail, err = store.TruncateTail(ntail)
-	if err != nil {
-		return 0, err
-	}
-	return int(ntail - otail), nil
 }
