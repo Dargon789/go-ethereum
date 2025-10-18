@@ -24,7 +24,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -246,6 +245,16 @@ var (
 	OverrideOsaka = &cli.Uint64Flag{
 		Name:     "override.osaka",
 		Usage:    "Manually specify the Osaka fork timestamp, overriding the bundled setting",
+		Category: flags.EthCategory,
+	}
+	OverrideBPO1 = &cli.Uint64Flag{
+		Name:     "override.bpo1",
+		Usage:    "Manually specify the bpo1 fork timestamp, overriding the bundled setting",
+		Category: flags.EthCategory,
+	}
+	OverrideBPO2 = &cli.Uint64Flag{
+		Name:     "override.bpo2",
+		Usage:    "Manually specify the bpo2 fork timestamp, overriding the bundled setting",
 		Category: flags.EthCategory,
 	}
 	OverrideVerkle = &cli.Uint64Flag{
@@ -604,6 +613,18 @@ var (
 		Name:     "rpc.logquerylimit",
 		Usage:    "Maximum number of alternative addresses or topics allowed per search position in eth_getLogs filter criteria (0 = no cap)",
 		Value:    ethconfig.Defaults.LogQueryLimit,
+		Category: flags.APICategory,
+	}
+	RPCTxSyncDefaultTimeoutFlag = &cli.DurationFlag{
+		Name:     "rpc.txsync.defaulttimeout",
+		Usage:    "Default timeout for eth_sendRawTransactionSync (e.g. 2s, 500ms)",
+		Value:    ethconfig.Defaults.TxSyncDefaultTimeout,
+		Category: flags.APICategory,
+	}
+	RPCTxSyncMaxTimeoutFlag = &cli.DurationFlag{
+		Name:     "rpc.txsync.maxtimeout",
+		Usage:    "Maximum allowed timeout for eth_sendRawTransactionSync (e.g. 5m)",
+		Value:    ethconfig.Defaults.TxSyncMaxTimeout,
 		Category: flags.APICategory,
 	}
 	// Authenticated RPC HTTP settings
@@ -1610,7 +1631,7 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	}
 	// Ensure Go's GC ignores the database cache for trigger percentage
 	cache := ctx.Int(CacheFlag.Name)
-	gogc := math.Max(20, math.Min(100, 100/(float64(cache)/1024)))
+	gogc := max(20, min(100, 100/(float64(cache)/1024)))
 
 	log.Debug("Sanitizing Go's GC trigger", "percent", int(gogc))
 	godebug.SetGCPercent(int(gogc))
@@ -1707,6 +1728,12 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	}
 	if ctx.IsSet(RPCGlobalLogQueryLimit.Name) {
 		cfg.LogQueryLimit = ctx.Int(RPCGlobalLogQueryLimit.Name)
+	}
+	if ctx.IsSet(RPCTxSyncDefaultTimeoutFlag.Name) {
+		cfg.TxSyncDefaultTimeout = ctx.Duration(RPCTxSyncDefaultTimeoutFlag.Name)
+	}
+	if ctx.IsSet(RPCTxSyncMaxTimeoutFlag.Name) {
+		cfg.TxSyncMaxTimeout = ctx.Duration(RPCTxSyncMaxTimeoutFlag.Name)
 	}
 	if !ctx.Bool(SnapshotFlag.Name) || cfg.SnapshotCache == 0 {
 		// If snap-sync is requested, this flag is also required
