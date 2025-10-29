@@ -1,5 +1,5 @@
 name: i386 linux tests
-
+#
 on:
   push:
     branches: [ master ]
@@ -13,7 +13,6 @@ jobs:
     runs-on: self-hosted
     steps:
     - uses: actions/checkout@v4
-
     # Cache build tools to avoid downloading them each time
     - uses: actions/cache@v4
       with:
