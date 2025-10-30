@@ -38,6 +38,8 @@ jobs:
     name: Keeper Builds
     needs: test
     runs-on: [self-hosted-ghr, size-l-x64]
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
