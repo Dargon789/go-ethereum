@@ -18,16 +18,15 @@
 package web3ext
 
 var Modules = map[string]string{
-	"admin":    AdminJs,
-	"clique":   CliqueJs,
-	"debug":    DebugJs,
-	"eth":      EthJs,
-	"miner":    MinerJs,
-	"net":      NetJs,
-	"personal": PersonalJs,
-	"rpc":      RpcJs,
-	"txpool":   TxpoolJs,
-	"dev":      DevJs,
+	"admin":  AdminJs,
+	"clique": CliqueJs,
+	"debug":  DebugJs,
+	"eth":    EthJs,
+	"miner":  MinerJs,
+	"net":    NetJs,
+	"rpc":    RpcJs,
+	"txpool": TxpoolJs,
+	"dev":    DevJs,
 }
 
 const CliqueJs = `
@@ -219,11 +218,6 @@ web3._extend({
 			params: 1
 		}),
 		new web3._extend.Method({
-			name: 'seedHash',
-			call: 'debug_seedHash',
-			params: 1
-		}),
-		new web3._extend.Method({
 			name: 'dumpBlock',
 			call: 'debug_dumpBlock',
 			params: 1,
@@ -249,11 +243,6 @@ web3._extend({
 			params: 1
 		}),
 		new web3._extend.Method({
-			name: 'backtraceAt',
-			call: 'debug_backtraceAt',
-			params: 1,
-		}),
-		new web3._extend.Method({
 			name: 'stacks',
 			call: 'debug_stacks',
 			params: 1,
@@ -268,6 +257,11 @@ web3._extend({
 		new web3._extend.Method({
 			name: 'setGCPercent',
 			call: 'debug_setGCPercent',
+			params: 1,
+		}),
+		new web3._extend.Method({
+			name: 'setMemoryLimit',
+			call: 'debug_setMemoryLimit',
 			params: 1,
 		}),
 		new web3._extend.Method({
@@ -469,6 +463,17 @@ web3._extend({
 			call: 'debug_getTrieFlushInterval',
 			params: 0
 		}),
+		new web3._extend.Method({
+			name: 'sync',
+			call: 'debug_sync',
+			params: 1
+		}),
+		new web3._extend.Method({
+			name: 'stateSize',
+			call: 'debug_stateSize',
+			params: 1,
+			inputFormatter: [null],
+		}),
 	],
 	properties: []
 });
@@ -504,8 +509,8 @@ web3._extend({
 		new web3._extend.Method({
 			name: 'estimateGas',
 			call: 'eth_estimateGas',
-			params: 3,
-			inputFormatter: [web3._extend.formatters.inputCallFormatter, web3._extend.formatters.inputBlockNumberFormatter, null],
+			params: 4,
+			inputFormatter: [web3._extend.formatters.inputCallFormatter, web3._extend.formatters.inputBlockNumberFormatter, null, null],
 			outputFormatter: web3._extend.utils.toDecimal
 		}),
 		new web3._extend.Method({
@@ -596,6 +601,11 @@ web3._extend({
 			call: 'eth_getBlockReceipts',
 			params: 1,
 		}),
+		new web3._extend.Method({
+			name: 'config',
+			call: 'eth_config',
+			params: 0,
+		})
 	],
 	properties: [
 		new web3._extend.Property({
@@ -656,62 +666,6 @@ web3._extend({
 		}),
 	]
 });
-`
-
-const PersonalJs = `
-web3._extend({
-	property: 'personal',
-	methods: [
-		new web3._extend.Method({
-			name: 'importRawKey',
-			call: 'personal_importRawKey',
-			params: 2
-		}),
-		new web3._extend.Method({
-			name: 'sign',
-			call: 'personal_sign',
-			params: 3,
-			inputFormatter: [null, web3._extend.formatters.inputAddressFormatter, null]
-		}),
-		new web3._extend.Method({
-			name: 'ecRecover',
-			call: 'personal_ecRecover',
-			params: 2
-		}),
-		new web3._extend.Method({
-			name: 'openWallet',
-			call: 'personal_openWallet',
-			params: 2
-		}),
-		new web3._extend.Method({
-			name: 'deriveAccount',
-			call: 'personal_deriveAccount',
-			params: 3
-		}),
-		new web3._extend.Method({
-			name: 'signTransaction',
-			call: 'personal_signTransaction',
-			params: 2,
-			inputFormatter: [web3._extend.formatters.inputTransactionFormatter, null]
-		}),
-		new web3._extend.Method({
-			name: 'unpair',
-			call: 'personal_unpair',
-			params: 2
-		}),
-		new web3._extend.Method({
-			name: 'initializeWallet',
-			call: 'personal_initializeWallet',
-			params: 1
-		})
-	],
-	properties: [
-		new web3._extend.Property({
-			name: 'listWallets',
-			getter: 'personal_listWallets'
-		}),
-	]
-})
 `
 
 const RpcJs = `

@@ -1,4 +1,4 @@
-// Copyright 2023 go-ethereum Authors
+// Copyright 2023 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
 // The go-ethereum library is free software: you can redistribute it and/or modify
@@ -17,6 +17,7 @@
 package trie
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -32,7 +33,6 @@ import (
 )
 
 var (
-	zero               [32]byte
 	errInvalidRootType = errors.New("invalid node type for root")
 )
 
@@ -41,36 +41,35 @@ var (
 type VerkleTrie struct {
 	root   verkle.VerkleNode
 	cache  *utils.PointCache
-	reader *trieReader
+	reader *Reader
+	tracer *PrevalueTracer
 }
 
 // NewVerkleTrie constructs a verkle tree based on the specified root hash.
-func NewVerkleTrie(root common.Hash, db database.Database, cache *utils.PointCache) (*VerkleTrie, error) {
-	reader, err := newTrieReader(root, common.Hash{}, db)
+func NewVerkleTrie(root common.Hash, db database.NodeDatabase, cache *utils.PointCache) (*VerkleTrie, error) {
+	reader, err := NewReader(root, common.Hash{}, db)
 	if err != nil {
 		return nil, err
 	}
-	// Parse the root verkle node if it's not empty.
-	node := verkle.New()
-	if root != types.EmptyVerkleHash && root != types.EmptyRootHash {
-		blob, err := reader.node(nil, common.Hash{})
-		if err != nil {
-			return nil, err
-		}
-		node, err = verkle.ParseNode(blob, 0)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return &VerkleTrie{
-		root:   node,
+	t := &VerkleTrie{
+		root:   verkle.New(),
 		cache:  cache,
 		reader: reader,
-	}, nil
-}
-
-func (t *VerkleTrie) FlatdbNodeResolver(path []byte) ([]byte, error) {
-	return t.reader.node(path, common.Hash{})
+		tracer: NewPrevalueTracer(),
+	}
+	// Parse the root verkle node if it's not empty.
+	if root != types.EmptyVerkleHash && root != types.EmptyRootHash {
+		blob, err := t.nodeResolver(nil)
+		if err != nil {
+			return nil, err
+		}
+		node, err := verkle.ParseNode(blob, 0)
+		if err != nil {
+			return nil, err
+		}
+		t.root = node
+	}
+	return t, nil
 }
 
 // GetKey returns the sha3 preimage of a hashed key that was previously used
@@ -109,6 +108,17 @@ func (t *VerkleTrie) GetAccount(addr common.Address) (*types.StateAccount, error
 	return acc, nil
 }
 
+// PrefetchAccount attempts to resolve specific accounts from the database
+// to accelerate subsequent trie operations.
+func (t *VerkleTrie) PrefetchAccount(addresses []common.Address) error {
+	for _, addr := range addresses {
+		if _, err := t.GetAccount(addr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // GetStorage implements state.Trie, retrieving the storage slot with the specified
 // account address and storage key. If the specified slot is not in the verkle tree,
 // nil will be returned. If the tree is corrupted, an error will be returned.
@@ -119,6 +129,17 @@ func (t *VerkleTrie) GetStorage(addr common.Address, key []byte) ([]byte, error)
 		return nil, err
 	}
 	return common.TrimLeftZeroes(val), nil
+}
+
+// PrefetchStorage attempts to resolve specific storage slots from the database
+// to accelerate subsequent trie operations.
+func (t *VerkleTrie) PrefetchStorage(addr common.Address, keys [][]byte) error {
+	for _, key := range keys {
+		if _, err := t.GetStorage(addr, key); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // UpdateAccount implements state.Trie, writing the provided account into the tree.
@@ -170,25 +191,35 @@ func (t *VerkleTrie) UpdateStorage(address common.Address, key, value []byte) er
 	return t.root.Insert(k, v[:], t.nodeResolver)
 }
 
-// DeleteAccount implements state.Trie, deleting the specified account from the
-// trie. If the account was not existent in the trie, no error will be returned.
-// If the trie is corrupted, an error will be returned.
+// DeleteAccount leaves the account untouched, as no account deletion can happen
+// in verkle.
+// There is a special corner case, in which an account that is prefunded, CREATE2-d
+// and then SELFDESTRUCT-d should see its funds drained. EIP161 says that account
+// should be removed, but this is verboten by the verkle spec. This contains a
+// workaround in which the method checks for this corner case, and if so, overwrites
+// the balance with 0. This will be removed once the spec has been clarified.
 func (t *VerkleTrie) DeleteAccount(addr common.Address) error {
-	var (
-		err    error
-		values = make([][]byte, verkle.NodeWidth)
-	)
-	for i := 0; i < verkle.NodeWidth; i++ {
-		values[i] = zero[:]
+	k := utils.BasicDataKeyWithEvaluatedAddress(t.cache.Get(addr.Bytes()))
+	values, err := t.root.(*verkle.InternalNode).GetValuesAtStem(k, t.nodeResolver)
+	if err != nil {
+		return fmt.Errorf("Error getting data at %x in delete: %w", k, err)
 	}
-	switch n := t.root.(type) {
-	case *verkle.InternalNode:
-		err = n.InsertValuesAtStem(t.cache.GetStem(addr.Bytes()), values, t.nodeResolver)
-		if err != nil {
-			return fmt.Errorf("DeleteAccount (%x) error: %v", addr, err)
+	var prefunded bool
+	for i, v := range values {
+		switch i {
+		case 0:
+			prefunded = len(v) == 32
+		case 1:
+			prefunded = len(v) == 32 && bytes.Equal(v, types.EmptyCodeHash[:])
+		default:
+			prefunded = v == nil
 		}
-	default:
-		return errInvalidRootType
+		if !prefunded {
+			break
+		}
+	}
+	if prefunded {
+		t.root.Insert(k, common.Hash{}.Bytes(), t.nodeResolver)
 	}
 	return nil
 }
@@ -258,7 +289,7 @@ func (t *VerkleTrie) Commit(_ bool) (common.Hash, *trienode.NodeSet) {
 	nodeset := trienode.NewNodeSet(common.Hash{})
 	for _, node := range nodes {
 		// Hash parameter is not used in pathdb
-		nodeset.AddNode(node.Path, trienode.New(common.Hash{}, node.SerializedBytes))
+		nodeset.AddNode(node.Path, trienode.NewNodeWithPrev(common.Hash{}, node.SerializedBytes, t.tracer.Get(node.Path)))
 	}
 	// Serialize root commitment form
 	return t.Hash(), nodeset
@@ -291,6 +322,7 @@ func (t *VerkleTrie) Copy() *VerkleTrie {
 		root:   t.root.Copy(),
 		cache:  t.cache,
 		reader: t.reader,
+		tracer: t.tracer.Copy(),
 	}
 }
 
@@ -302,21 +334,19 @@ func (t *VerkleTrie) IsVerkle() bool {
 // Proof builds and returns the verkle multiproof for keys, built against
 // the pre tree. The post tree is passed in order to add the post values
 // to that proof.
-func (t *VerkleTrie) Proof(posttrie *VerkleTrie, keys [][]byte, resolver verkle.NodeResolverFn) (*verkle.VerkleProof, verkle.StateDiff, error) {
+func (t *VerkleTrie) Proof(posttrie *VerkleTrie, keys [][]byte) (*verkle.VerkleProof, verkle.StateDiff, error) {
 	var postroot verkle.VerkleNode
 	if posttrie != nil {
 		postroot = posttrie.root
 	}
-	proof, _, _, _, err := verkle.MakeVerkleMultiProof(t.root, postroot, keys, resolver)
+	proof, _, _, _, err := verkle.MakeVerkleMultiProof(t.root, postroot, keys, t.nodeResolver)
 	if err != nil {
 		return nil, nil, err
 	}
-
 	p, kvps, err := verkle.SerializeProof(proof)
 	if err != nil {
 		return nil, nil, err
 	}
-
 	return p, kvps, nil
 }
 
@@ -413,10 +443,15 @@ func (t *VerkleTrie) ToDot() string {
 }
 
 func (t *VerkleTrie) nodeResolver(path []byte) ([]byte, error) {
-	return t.reader.node(path, common.Hash{})
+	blob, err := t.reader.Node(path, common.Hash{})
+	if err != nil {
+		return nil, err
+	}
+	t.tracer.Put(path, blob)
+	return blob, nil
 }
 
 // Witness returns a set containing all trie nodes that have been accessed.
-func (t *VerkleTrie) Witness() map[string]struct{} {
+func (t *VerkleTrie) Witness() map[string][]byte {
 	panic("not implemented")
 }
