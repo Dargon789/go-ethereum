@@ -24,6 +24,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/stateless"
@@ -272,26 +273,26 @@ func storageRangeAt(statedb *state.StateDB, root common.Hash, address common.Add
 //
 // With one parameter, returns the list of accounts modified in the specified block.
 func (api *DebugAPI) GetModifiedAccountsByNumber(startNum uint64, endNum *uint64) ([]common.Address, error) {
-	var startHeader, endHeader *types.Header
+	var startBlock, endBlock *types.Block
 
-	startHeader = api.eth.blockchain.GetHeaderByNumber(startNum)
-	if startHeader == nil {
+	startBlock = api.eth.blockchain.GetBlockByNumber(startNum)
+	if startBlock == nil {
 		return nil, fmt.Errorf("start block %x not found", startNum)
 	}
 
 	if endNum == nil {
-		endHeader = startHeader
-		startHeader = api.eth.blockchain.GetHeaderByHash(startHeader.ParentHash)
-		if startHeader == nil {
-			return nil, fmt.Errorf("block %x has no parent", endHeader.Number)
+		endBlock = startBlock
+		startBlock = api.eth.blockchain.GetBlockByHash(startBlock.ParentHash())
+		if startBlock == nil {
+			return nil, fmt.Errorf("block %x has no parent", endBlock.Number())
 		}
 	} else {
-		endHeader = api.eth.blockchain.GetHeaderByNumber(*endNum)
-		if endHeader == nil {
+		endBlock = api.eth.blockchain.GetBlockByNumber(*endNum)
+		if endBlock == nil {
 			return nil, fmt.Errorf("end block %d not found", *endNum)
 		}
 	}
-	return api.getModifiedAccounts(startHeader, endHeader)
+	return api.getModifiedAccounts(startBlock, endBlock)
 }
 
 // GetModifiedAccountsByHash returns all accounts that have changed between the
@@ -300,38 +301,38 @@ func (api *DebugAPI) GetModifiedAccountsByNumber(startNum uint64, endNum *uint64
 //
 // With one parameter, returns the list of accounts modified in the specified block.
 func (api *DebugAPI) GetModifiedAccountsByHash(startHash common.Hash, endHash *common.Hash) ([]common.Address, error) {
-	var startHeader, endHeader *types.Header
-	startHeader = api.eth.blockchain.GetHeaderByHash(startHash)
-	if startHeader == nil {
+	var startBlock, endBlock *types.Block
+	startBlock = api.eth.blockchain.GetBlockByHash(startHash)
+	if startBlock == nil {
 		return nil, fmt.Errorf("start block %x not found", startHash)
 	}
 
 	if endHash == nil {
-		endHeader = startHeader
-		startHeader = api.eth.blockchain.GetHeaderByHash(startHeader.ParentHash)
-		if startHeader == nil {
-			return nil, fmt.Errorf("block %x has no parent", endHeader.Number)
+		endBlock = startBlock
+		startBlock = api.eth.blockchain.GetBlockByHash(startBlock.ParentHash())
+		if startBlock == nil {
+			return nil, fmt.Errorf("block %x has no parent", endBlock.Number())
 		}
 	} else {
-		endHeader = api.eth.blockchain.GetHeaderByHash(*endHash)
-		if endHeader == nil {
+		endBlock = api.eth.blockchain.GetBlockByHash(*endHash)
+		if endBlock == nil {
 			return nil, fmt.Errorf("end block %x not found", *endHash)
 		}
 	}
-	return api.getModifiedAccounts(startHeader, endHeader)
+	return api.getModifiedAccounts(startBlock, endBlock)
 }
 
-func (api *DebugAPI) getModifiedAccounts(startHeader, endHeader *types.Header) ([]common.Address, error) {
-	if startHeader.Number.Uint64() >= endHeader.Number.Uint64() {
-		return nil, fmt.Errorf("start block height (%d) must be less than end block height (%d)", startHeader.Number.Uint64(), endHeader.Number.Uint64())
+func (api *DebugAPI) getModifiedAccounts(startBlock, endBlock *types.Block) ([]common.Address, error) {
+	if startBlock.Number().Uint64() >= endBlock.Number().Uint64() {
+		return nil, fmt.Errorf("start block height (%d) must be less than end block height (%d)", startBlock.Number().Uint64(), endBlock.Number().Uint64())
 	}
 	triedb := api.eth.BlockChain().TrieDB()
 
-	oldTrie, err := trie.NewStateTrie(trie.StateTrieID(startHeader.Root), triedb)
+	oldTrie, err := trie.NewStateTrie(trie.StateTrieID(startBlock.Root()), triedb)
 	if err != nil {
 		return nil, err
 	}
-	newTrie, err := trie.NewStateTrie(trie.StateTrieID(endHeader.Root), triedb)
+	newTrie, err := trie.NewStateTrie(trie.StateTrieID(endBlock.Root()), triedb)
 	if err != nil {
 		return nil, err
 	}
@@ -445,90 +446,72 @@ func (api *DebugAPI) GetTrieFlushInterval() (string, error) {
 	return api.eth.blockchain.GetTrieFlushInterval().String(), nil
 }
 
-// StateSize returns the current state size statistics from the state size tracker.
-// Returns an error if the state size tracker is not initialized or if stats are not ready.
-func (api *DebugAPI) StateSize(blockHashOrNumber *rpc.BlockNumberOrHash) (interface{}, error) {
-	sizer := api.eth.blockchain.StateSizer()
-	if sizer == nil {
-		return nil, errors.New("state size tracker is not enabled")
-	}
-	var (
-		err   error
-		stats *state.SizeStats
-	)
-	if blockHashOrNumber == nil {
-		stats, err = sizer.Query(nil)
-	} else {
-		header, herr := api.eth.APIBackend.HeaderByNumberOrHash(context.Background(), *blockHashOrNumber)
-		if herr != nil || header == nil {
-			return nil, fmt.Errorf("block %s is unknown", blockHashOrNumber)
-		}
-		stats, err = sizer.Query(&header.Root)
-	}
+func (api *DebugAPI) ExecutionWitness(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) (*ExecutionWitness, error) {
+	block, err := api.eth.APIBackend.BlockByNumberOrHash(ctx, blockNrOrHash)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to retrieve block: %w", err)
 	}
-	if stats == nil {
-		var s string
-		if blockHashOrNumber == nil {
-			s = "chain head"
-		} else {
-			s = blockHashOrNumber.String()
-		}
-		return nil, fmt.Errorf("state size of %s is not available", s)
-	}
-	return map[string]interface{}{
-		"stateRoot":            stats.StateRoot,
-		"blockNumber":          hexutil.Uint64(stats.BlockNumber),
-		"accounts":             hexutil.Uint64(stats.Accounts),
-		"accountBytes":         hexutil.Uint64(stats.AccountBytes),
-		"storages":             hexutil.Uint64(stats.Storages),
-		"storageBytes":         hexutil.Uint64(stats.StorageBytes),
-		"accountTrienodes":     hexutil.Uint64(stats.AccountTrienodes),
-		"accountTrienodeBytes": hexutil.Uint64(stats.AccountTrienodeBytes),
-		"storageTrienodes":     hexutil.Uint64(stats.StorageTrienodes),
-		"storageTrienodeBytes": hexutil.Uint64(stats.StorageTrienodeBytes),
-		"contractCodes":        hexutil.Uint64(stats.ContractCodes),
-		"contractCodeBytes":    hexutil.Uint64(stats.ContractCodeBytes),
-	}, nil
-}
-
-func (api *DebugAPI) ExecutionWitness(bn rpc.BlockNumber) (*stateless.ExtWitness, error) {
-	bc := api.eth.blockchain
-	block, err := api.eth.APIBackend.BlockByNumber(context.Background(), bn)
-	if err != nil {
-		return &stateless.ExtWitness{}, fmt.Errorf("block number %v not found", bn)
-	}
-
-	parent := bc.GetHeader(block.ParentHash(), block.NumberU64()-1)
-	if parent == nil {
-		return &stateless.ExtWitness{}, fmt.Errorf("block number %v found, but parent missing", bn)
-	}
-
-	result, err := bc.ProcessBlock(parent.Root, block, false, true)
-	if err != nil {
-		return nil, err
-	}
-
-	return result.Witness().ToExtWitness(), nil
-}
-
-func (api *DebugAPI) ExecutionWitnessByHash(hash common.Hash) (*stateless.ExtWitness, error) {
-	bc := api.eth.blockchain
-	block := bc.GetBlockByHash(hash)
 	if block == nil {
-		return &stateless.ExtWitness{}, fmt.Errorf("block hash %x not found", hash)
+		return nil, fmt.Errorf("block not found: %s", blockNrOrHash.String())
 	}
 
-	parent := bc.GetHeader(block.ParentHash(), block.NumberU64()-1)
-	if parent == nil {
-		return &stateless.ExtWitness{}, fmt.Errorf("block number %x found, but parent missing", hash)
-	}
+	witness, err := generateWitness(api.eth.blockchain, block)
+	return ToExecutionWitness(witness), err
+}
 
-	result, err := bc.ProcessBlock(parent.Root, block, false, true)
+func generateWitness(blockchain *core.BlockChain, block *types.Block) (*stateless.Witness, error) {
+	witness, err := stateless.NewWitness(block.Header(), blockchain)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create witness: %w", err)
 	}
 
-	return result.Witness().ToExtWitness(), nil
+	parentHeader := witness.Headers[0]
+	statedb, err := blockchain.StateAt(parentHeader.Root)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve parent state: %w", err)
+	}
+
+	statedb.StartPrefetcher("debug_execution_witness", witness)
+	defer statedb.StopPrefetcher()
+
+	res, err := blockchain.Processor().Process(block, statedb, *blockchain.GetVMConfig())
+	if err != nil {
+		return nil, fmt.Errorf("failed to process block %d: %w", block.Number(), err)
+	}
+
+	if err := blockchain.Validator().ValidateState(block, statedb, res, false); err != nil {
+		return nil, fmt.Errorf("failed to validate block %d: %w", block.Number(), err)
+	}
+
+	return witness, nil
+}
+
+// ExecutionWitness is a witness json encoding for transferring across the network.
+// In the future, we'll probably consider using the extWitness format instead for less overhead if performance becomes an issue.
+// Currently using this format for ease of reading, parsing and compatibility across clients.
+type ExecutionWitness struct {
+	Headers []*types.Header   `json:"headers"`
+	Codes   map[string]string `json:"codes"`
+	State   map[string]string `json:"state"`
+}
+
+func transformMap(in map[string]struct{}) map[string]string {
+	out := make(map[string]string, len(in))
+	for item := range in {
+		bytes := []byte(item)
+		key := crypto.Keccak256Hash(bytes).Hex()
+		out[key] = hexutil.Encode(bytes)
+	}
+	return out
+}
+
+// ToExecutionWitness converts a witness to an execution witness format that is compatible with reth.
+// keccak(node) => node
+// keccak(bytecodes) => bytecodes
+func ToExecutionWitness(w *stateless.Witness) *ExecutionWitness {
+	return &ExecutionWitness{
+		Headers: w.Headers,
+		Codes:   transformMap(w.Codes),
+		State:   transformMap(w.State),
+	}
 }

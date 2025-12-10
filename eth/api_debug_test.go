@@ -18,14 +18,12 @@ package eth
 
 import (
 	"bytes"
-	"crypto/ecdsa"
 	"fmt"
 	"math/big"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/ethereum/go-ethereum/common"
@@ -35,55 +33,15 @@ import (
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/holiman/uint256"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var dumper = spew.ConfigState{Indent: "    "}
-
-type Account struct {
-	key  *ecdsa.PrivateKey
-	addr common.Address
-}
-
-func newAccounts(n int) (accounts []Account) {
-	for i := 0; i < n; i++ {
-		key, _ := crypto.GenerateKey()
-		addr := crypto.PubkeyToAddress(key.PublicKey)
-		accounts = append(accounts, Account{key: key, addr: addr})
-	}
-	slices.SortFunc(accounts, func(a, b Account) int { return a.addr.Cmp(b.addr) })
-	return accounts
-}
-
-// newTestBlockChain creates a new test blockchain. OBS: After test is done, teardown must be
-// invoked in order to release associated resources.
-func newTestBlockChain(t *testing.T, n int, gspec *core.Genesis, generator func(i int, b *core.BlockGen)) *core.BlockChain {
-	engine := ethash.NewFaker()
-	// Generate blocks for testing
-	_, blocks, _ := core.GenerateChainWithGenesis(gspec, engine, n, generator)
-
-	// Import the canonical chain
-	options := &core.BlockChainConfig{
-		TrieCleanLimit: 256,
-		TrieDirtyLimit: 256,
-		TrieTimeLimit:  5 * time.Minute,
-		SnapshotLimit:  0,
-		Preimages:      true,
-		ArchiveMode:    true, // Archive mode
-	}
-	chain, err := core.NewBlockChain(rawdb.NewMemoryDatabase(), gspec, engine, options)
-	if err != nil {
-		t.Fatalf("failed to create tester chain: %v", err)
-	}
-	if n, err := chain.InsertChain(blocks); err != nil {
-		t.Fatalf("block %d: failed to insert into chain: %v", n, err)
-	}
-	return chain
-}
 
 func accountRangeTest(t *testing.T, trie *state.Trie, statedb *state.StateDB, start common.Hash, requestedNum int, expectedNum int) state.Dump {
 	result := statedb.RawDump(&state.DumpConfig{
@@ -130,7 +88,7 @@ func TestAccountRange(t *testing.T) {
 			m[addr] = true
 		}
 	}
-	root, _ := sdb.Commit(0, true, false)
+	root, _ := sdb.Commit(0, true)
 	sdb, _ = state.New(root, statedb)
 
 	trie, err := statedb.OpenTrie(root)
@@ -188,7 +146,7 @@ func TestEmptyAccountRange(t *testing.T) {
 		st, _   = state.New(types.EmptyRootHash, statedb)
 	)
 	// Commit(although nothing to flush) and re-init the statedb
-	st.Commit(0, true, false)
+	st.Commit(0, true)
 	st, _ = state.New(types.EmptyRootHash, statedb)
 
 	results := st.RawDump(&state.DumpConfig{
@@ -231,7 +189,7 @@ func TestStorageRangeAt(t *testing.T) {
 	for _, entry := range storage {
 		sdb.SetState(addr, *entry.Key, entry.Value)
 	}
-	root, _ := sdb.Commit(0, false, false)
+	root, _ := sdb.Commit(0, false)
 	sdb, _ = state.New(root, db)
 
 	// Check a few combinations of limit and start/end.
@@ -273,65 +231,56 @@ func TestStorageRangeAt(t *testing.T) {
 	}
 }
 
-func TestGetModifiedAccounts(t *testing.T) {
+func TestExecutionWitness(t *testing.T) {
 	t.Parallel()
 
-	// Initialize test accounts
-	accounts := newAccounts(4)
-	genesis := &core.Genesis{
-		Config: params.TestChainConfig,
-		Alloc: types.GenesisAlloc{
-			accounts[0].addr: {Balance: big.NewInt(params.Ether)},
-			accounts[1].addr: {Balance: big.NewInt(params.Ether)},
-			accounts[2].addr: {Balance: big.NewInt(params.Ether)},
-			accounts[3].addr: {Balance: big.NewInt(params.Ether)},
-		},
+	var (
+		db    = rawdb.NewMemoryDatabase()
+		gspec = &core.Genesis{
+			Config: params.TestChainConfig,
+			Alloc:  types.GenesisAlloc{testAddr: {Balance: big.NewInt(1000000000000000)}},
+		}
+		chain, _ = core.NewBlockChain(db, nil, gspec, nil, ethash.NewFaker(), vm.Config{}, nil)
+		signer   = types.LatestSigner(gspec.Config)
+	)
+	// Create a database pre-initialize with a genesis block
+
+	blockNum := 10
+	_, bs, _ := core.GenerateChainWithGenesis(gspec, ethash.NewFaker(), blockNum, func(i int, g *core.BlockGen) {
+		if i == 0 {
+			return
+		}
+
+		// add more transactions to the block
+		for j := 0; j < 10; j++ {
+			tx, err := types.SignNewTx(testKey, signer, &types.DynamicFeeTx{
+				ChainID:    gspec.Config.ChainID,
+				Nonce:      uint64((i-1)*10 + j),
+				GasTipCap:  common.Big0,
+				GasFeeCap:  g.PrevBlock(0).BaseFee(),
+				Gas:        50000,
+				To:         &common.Address{0xaa},
+				Value:      big.NewInt(int64(i)),
+				Data:       nil,
+				AccessList: nil,
+			})
+			if err != nil {
+				t.Fatalf("error creating tx: %v", err)
+			}
+			g.AddTx(tx)
+		}
+	})
+
+	if _, err := chain.InsertChain(bs); err != nil {
+		panic(err)
 	}
-	genBlocks := 1
-	signer := types.HomesteadSigner{}
-	blockChain := newTestBlockChain(t, genBlocks, genesis, func(_ int, b *core.BlockGen) {
-		// Transfer from account[0] to account[1]
-		//    value: 1000 wei
-		//    fee:   0 wei
-		for _, account := range accounts[:3] {
-			tx, _ := types.SignTx(types.NewTx(&types.LegacyTx{
-				Nonce:    0,
-				To:       &accounts[3].addr,
-				Value:    big.NewInt(1000),
-				Gas:      params.TxGas,
-				GasPrice: b.BaseFee(),
-				Data:     nil}),
-				signer, account.key)
-			b.AddTx(tx)
-		}
-	})
-	defer blockChain.Stop()
 
-	// Create a debug API instance.
-	api := NewDebugAPI(&Ethereum{blockchain: blockChain})
+	block := chain.GetBlockByNumber(uint64(blockNum - 1))
+	require.NotNil(t, block)
 
-	// Test GetModifiedAccountsByNumber
-	t.Run("GetModifiedAccountsByNumber", func(t *testing.T) {
-		addrs, err := api.GetModifiedAccountsByNumber(uint64(genBlocks), nil)
-		assert.NoError(t, err)
-		assert.Len(t, addrs, len(accounts)+1) // +1 for the coinbase
-		for _, account := range accounts {
-			if !slices.Contains(addrs, account.addr) {
-				t.Fatalf("account %s not found in modified accounts", account.addr.Hex())
-			}
-		}
-	})
+	witness, err := generateWitness(chain, block)
+	require.NoError(t, err)
 
-	// Test GetModifiedAccountsByHash
-	t.Run("GetModifiedAccountsByHash", func(t *testing.T) {
-		header := blockChain.GetHeaderByNumber(uint64(genBlocks))
-		addrs, err := api.GetModifiedAccountsByHash(header.Hash(), nil)
-		assert.NoError(t, err)
-		assert.Len(t, addrs, len(accounts)+1) // +1 for the coinbase
-		for _, account := range accounts {
-			if !slices.Contains(addrs, account.addr) {
-				t.Fatalf("account %s not found in modified accounts", account.addr.Hex())
-			}
-		}
-	})
+	_, _, err = core.ExecuteStateless(params.TestChainConfig, block, witness)
+	require.NoError(t, err)
 }
