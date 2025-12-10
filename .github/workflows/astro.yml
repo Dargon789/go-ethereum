@@ -25,7 +25,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  BUILD_PATH: subfolder # default value when not using subfolders
+  BUILD_PATH: . # default path when the Astro project is at the repository root
 
 jobs:
   build:
