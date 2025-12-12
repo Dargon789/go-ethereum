@@ -1,0 +1,72 @@
+name: Makefile CI
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+permissions:
+  contents: read
+# Autoconf version requirement
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install autoconf dependencies
+      run: sudo apt-get update && sudo apt-get install -y autoconf
+      
+    - name: Verify configure.ac existence
+      run: |
+         if [ ! -f configure.ac ]; then
+           echo "Missing configure.ac file. Please add it to the repository."
+           exit 1
+         fi
+# Example configure.ac file
+AC_PREREQ([2.69])  # Autoconf version requirement
+AC_INIT([go-ethereum], [1.0], [support@go-ethereum.org])
+AC_CONFIG_SRCDIR([src/main.c]) # Replace with your project's main source file
+AC_CONFIG_HEADERS([config.h])
+
+# Checks for programs
+AC_PROG_CC  # Check for C compiler
+AC_PROG_MAKE_SET  # Check for make
+
+# Checks for libraries
+
+# Checks for header files
+
+# Other configuration settings
+
+AC_OUTPUT  # Generate output files
+AC_INIT([go-ethereum], [1.0], [support@go-ethereum.org])
+AC_CONFIG_SRCDIR([src/main.c]) # Replace with your project's main source file
+AC_CONFIG_HEADERS([config.h])
+
+# Checks for programs
+AC_PROG_CC  # Check for C compiler
+AC_PROG_MAKE_SET  # Check for make
+
+# Checks for libraries
+
+# Checks for header files
+
+# Other configuration settings
+
+AC_OUTPUT  # Generate output files
+    - name: Generate configure script
+      run: autoreconf --install
+
+    - name: configure
+      run: ./configure
+
+    - name: Install dependencies
+      run: make
+
+    - name: Run check
+      run: make check
+
+    - name: Run distcheck
+      run: make distcheck
