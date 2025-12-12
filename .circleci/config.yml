@@ -22,7 +22,6 @@ jobs:
     steps:
       # replace with your preferred image
       # Checkout the code as the first step.
-      - docker/install-docker
       - checkout
       - run:
           name: "Say hello"
