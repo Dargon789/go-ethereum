@@ -29,7 +29,13 @@ jobs:
 
             const match = prTitle.match(titleRegex);
             const dirPart = match[1];
-            const directories = dirPart.split(',').map(d => d.trim());
+            const rawDirectories = dirPart.split(',').map(d => d.trim());
+            const hasEmptyDirectory = rawDirectories.some(d => !d);
+            if (hasEmptyDirectory) {
+              core.setFailed(`PR title "${prTitle}" contains empty directory names. Please remove extra commas or spaces.`);
+              return;
+            }
+            const directories = rawDirectories.filter(Boolean);
             const missingDirs = [];
             for (const dir of directories) {
               const fullPath = path.join(process.env.GITHUB_WORKSPACE, dir);
