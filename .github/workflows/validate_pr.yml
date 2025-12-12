@@ -35,9 +35,8 @@ jobs:
               core.setFailed(`PR title "${prTitle}" contains empty directory names. Please remove extra commas or spaces.`);
               return;
             }
-            const directories = rawDirectories.filter(Boolean);
             const missingDirs = [];
-            for (const dir of directories) {
+            for (const dir of rawDirectories) {
               const fullPath = path.join(process.env.GITHUB_WORKSPACE, dir);
               if (!fs.existsSync(fullPath)) {
                 missingDirs.push(dir);
