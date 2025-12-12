@@ -276,9 +276,9 @@ func doInstall(cmdline []string) {
 
 // doInstallKeeper builds keeper binaries for all supported targets.
 func doInstallKeeper(cmdline []string) {
-	var dlgo = flag.Bool("dlgo", false, "Download Go and build with it")
-
-	flag.CommandLine.Parse(cmdline)
+	fs := flag.NewFlagSet("keeper", flag.ExitOnError)
+	dlgo := fs.Bool("dlgo", false, "Download Go and build with it")
+	fs.Parse(cmdline)
 	env := build.Env()
 
 	// Configure the toolchain.
