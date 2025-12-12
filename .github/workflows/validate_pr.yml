@@ -19,5 +19,4 @@ jobs:
               core.setFailed(`PR title "${prTitle}" does not match required format: directory, ...: description`);
               return;
             }
-            
             console.log('✅ PR title format is valid');
