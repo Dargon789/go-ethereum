@@ -1,5 +1,7 @@
 name: i386 linux tests
 #
+permissions:
+  contents: read
 on:
   push:
     branches: [ master ]
