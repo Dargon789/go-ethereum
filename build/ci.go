@@ -276,9 +276,9 @@ func doInstall(cmdline []string) {
 
 // doInstallKeeper builds keeper binaries for all supported targets.
 func doInstallKeeper(cmdline []string) {
-	var dlgo = flag.Bool("dlgo", false, "Download Go and build with it")
-
-	flag.CommandLine.Parse(cmdline)
+	fs := flag.NewFlagSet("keeper", flag.ExitOnError)
+	dlgo := fs.Bool("dlgo", false, "Download Go and build with it")
+	fs.Parse(cmdline)
 	env := build.Env()
 
 	// Configure the toolchain.
@@ -718,12 +718,13 @@ func doArchive(cmdline []string) {
 }
 
 func doKeeperArchive(cmdline []string) {
+	fs := flag.NewFlagSet("keeper-archive", flag.ExitOnError)
 	var (
-		signer  = flag.String("signer", "", `Environment variable holding the signing key (e.g. LINUX_SIGNING_KEY)`)
-		signify = flag.String("signify", "", `Environment variable holding the signify key (e.g. LINUX_SIGNIFY_KEY)`)
-		upload  = flag.String("upload", "", `Destination to upload the archives (usually "gethstore/builds")`)
+		signer  = fs.String("signer", "", `Environment variable holding the signing key (e.g. LINUX_SIGNING_KEY)`)
+		signify = fs.String("signify", "", `Environment variable holding the signify key (e.g. LINUX_SIGNIFY_KEY)`)
+		upload  = fs.String("upload", "", `Destination to upload the archives (usually "gethstore/builds")`)
 	)
-	flag.CommandLine.Parse(cmdline)
+	fs.Parse(cmdline)
 
 	var (
 		env    = build.Env()
