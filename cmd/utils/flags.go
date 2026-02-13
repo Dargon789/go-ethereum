@@ -295,6 +295,18 @@ var (
 		Value:    ethconfig.Defaults.StateHistory,
 		Category: flags.StateCategory,
 	}
+	TrienodeHistoryFlag = &cli.Int64Flag{
+		Name:     "history.trienode",
+		Usage:    "Number of recent blocks to retain trienode history for, only relevant in state.scheme=path (default/negative = disabled, 0 = entire chain)",
+		Value:    ethconfig.Defaults.TrienodeHistory,
+		Category: flags.StateCategory,
+	}
+	TrienodeHistoryFullValueCheckpointFlag = &cli.UintFlag{
+		Name:     "history.trienode.full-value-checkpoint",
+		Usage:    "The frequency of full-value encoding. Every n-th node is stored in full-value format; all other nodes are stored as diffs relative to their predecessor",
+		Value:    uint(ethconfig.Defaults.NodeFullValueCheckpoint),
+		Category: flags.StateCategory,
+	}
 	TransactionHistoryFlag = &cli.Uint64Flag{
 		Name:     "history.transactions",
 		Usage:    "Number of recent blocks to maintain transactions index for (default = about one year, 0 = entire chain)",
@@ -636,6 +648,12 @@ var (
 		Value:    ethconfig.Defaults.TxSyncMaxTimeout,
 		Category: flags.APICategory,
 	}
+	RPCGlobalRangeLimitFlag = &cli.Uint64Flag{
+		Name:     "rpc.rangelimit",
+		Usage:    "Maximum block range (end - begin) allowed for range queries (0 = unlimited)",
+		Value:    ethconfig.Defaults.RangeLimit,
+		Category: flags.APICategory,
+	}
 	// Authenticated RPC HTTP settings
 	AuthListenFlag = &cli.StringFlag{
 		Name:     "authrpc.addr",
@@ -674,7 +692,7 @@ var (
 	}
 	LogSlowBlockFlag = &cli.DurationFlag{
 		Name:     "debug.logslowblock",
-		Usage:    "Block execution time threshold beyond which detailed statistics will be logged (0 means disable)",
+		Usage:    "Block execution time threshold beyond which detailed statistics will be logged (0 logs all blocks, negative means disable)",
 		Value:    ethconfig.Defaults.SlowBlockThreshold,
 		Category: flags.LoggingCategory,
 	}
@@ -1023,6 +1041,12 @@ Please note that --` + MetricsHTTPFlag.Name + ` must be set to start the server.
 		Usage:    "InfluxDB organization name (v2 only)",
 		Value:    metrics.DefaultConfig.InfluxDBOrganization,
 		Category: flags.MetricsCategory,
+	}
+
+	// Era flags are a group of flags related to the era archive format.
+	EraFormatFlag = &cli.StringFlag{
+		Name:  "era.format",
+		Usage: "Archive format: 'era1' or 'erae'",
 	}
 )
 
@@ -1699,6 +1723,12 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	if ctx.IsSet(StateHistoryFlag.Name) {
 		cfg.StateHistory = ctx.Uint64(StateHistoryFlag.Name)
 	}
+	if ctx.IsSet(TrienodeHistoryFlag.Name) {
+		cfg.TrienodeHistory = ctx.Int64(TrienodeHistoryFlag.Name)
+	}
+	if ctx.IsSet(TrienodeHistoryFullValueCheckpointFlag.Name) {
+		cfg.NodeFullValueCheckpoint = uint32(ctx.Uint(TrienodeHistoryFullValueCheckpointFlag.Name))
+	}
 	if ctx.IsSet(StateSchemeFlag.Name) {
 		cfg.StateScheme = ctx.String(StateSchemeFlag.Name)
 	}
@@ -1752,6 +1782,9 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	}
 	if ctx.IsSet(RPCTxSyncMaxTimeoutFlag.Name) {
 		cfg.TxSyncMaxTimeout = ctx.Duration(RPCTxSyncMaxTimeoutFlag.Name)
+	}
+	if ctx.IsSet(RPCGlobalRangeLimitFlag.Name) {
+		cfg.RangeLimit = ctx.Uint64(RPCGlobalRangeLimitFlag.Name)
 	}
 	if !ctx.Bool(SnapshotFlag.Name) || cfg.SnapshotCache == 0 {
 		// If snap-sync is requested, this flag is also required
@@ -2097,6 +2130,7 @@ func RegisterFilterAPI(stack *node.Node, backend ethapi.Backend, ethcfg *ethconf
 	filterSystem := filters.NewFilterSystem(backend, filters.Config{
 		LogCacheSize:  ethcfg.FilterLogCacheSize,
 		LogQueryLimit: ethcfg.LogQueryLimit,
+		RangeLimit:    ethcfg.RangeLimit,
 	})
 	stack.RegisterAPIs([]rpc.API{{
 		Namespace: "eth",
@@ -2299,15 +2333,17 @@ func MakeChain(ctx *cli.Context, stack *node.Node, readonly bool) (*core.BlockCh
 		Fatalf("%v", err)
 	}
 	options := &core.BlockChainConfig{
-		TrieCleanLimit: ethconfig.Defaults.TrieCleanCache,
-		NoPrefetch:     ctx.Bool(CacheNoPrefetchFlag.Name),
-		TrieDirtyLimit: ethconfig.Defaults.TrieDirtyCache,
-		ArchiveMode:    ctx.String(GCModeFlag.Name) == "archive",
-		TrieTimeLimit:  ethconfig.Defaults.TrieTimeout,
-		SnapshotLimit:  ethconfig.Defaults.SnapshotCache,
-		Preimages:      ctx.Bool(CachePreimagesFlag.Name),
-		StateScheme:    scheme,
-		StateHistory:   ctx.Uint64(StateHistoryFlag.Name),
+		TrieCleanLimit:          ethconfig.Defaults.TrieCleanCache,
+		NoPrefetch:              ctx.Bool(CacheNoPrefetchFlag.Name),
+		TrieDirtyLimit:          ethconfig.Defaults.TrieDirtyCache,
+		ArchiveMode:             ctx.String(GCModeFlag.Name) == "archive",
+		TrieTimeLimit:           ethconfig.Defaults.TrieTimeout,
+		SnapshotLimit:           ethconfig.Defaults.SnapshotCache,
+		Preimages:               ctx.Bool(CachePreimagesFlag.Name),
+		StateScheme:             scheme,
+		StateHistory:            ctx.Uint64(StateHistoryFlag.Name),
+		TrienodeHistory:         ctx.Int64(TrienodeHistoryFlag.Name),
+		NodeFullValueCheckpoint: uint32(ctx.Uint(TrienodeHistoryFullValueCheckpointFlag.Name)),
 
 		// Disable transaction indexing/unindexing.
 		TxLookupLimit: -1,
@@ -2321,8 +2357,12 @@ func MakeChain(ctx *cli.Context, stack *node.Node, readonly bool) (*core.BlockCh
 		// Enable state size tracking if enabled
 		StateSizeTracking: ctx.Bool(StateSizeTrackingFlag.Name),
 
-		// Configure the slow block statistic logger
-		SlowBlockThreshold: ctx.Duration(LogSlowBlockFlag.Name),
+		// Configure the slow block statistic logger (disabled by default)
+		SlowBlockThreshold: ethconfig.Defaults.SlowBlockThreshold,
+	}
+	// Only enable slow block logging if the flag was explicitly set
+	if ctx.IsSet(LogSlowBlockFlag.Name) {
+		options.SlowBlockThreshold = ctx.Duration(LogSlowBlockFlag.Name)
 	}
 	if options.ArchiveMode && !options.Preimages {
 		options.Preimages = true
