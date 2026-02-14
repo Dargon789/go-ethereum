@@ -524,6 +524,7 @@ func (h *handler) handleCall(cp *callProc, msg *jsonrpcMessage) *jsonrpcMessage 
 	}
 
 	// Start root span for the request.
+	var err error
 	rpcInfo := telemetry.RPCInfo{
 		System:    "jsonrpc",
 		Service:   service,
@@ -534,25 +535,24 @@ func (h *handler) handleCall(cp *callProc, msg *jsonrpcMessage) *jsonrpcMessage 
 		telemetry.BoolAttribute("rpc.batch", cp.isBatch),
 	}
 	ctx, spanEnd := telemetry.StartServerSpan(cp.ctx, h.tracer(), rpcInfo, attrib...)
-	defer spanEnd(nil) // don't propagate errors to parent spans
+	defer spanEnd(err)
 
 	// Start tracing span before parsing arguments.
 	_, _, pSpanEnd := telemetry.StartSpanWithTracer(ctx, h.tracer(), "rpc.parsePositionalArguments")
-	args, pErr := parsePositionalArguments(msg.Params, callb.argTypes)
-	pSpanEnd(&pErr)
-	if pErr != nil {
-		return msg.errorResponse(&invalidParamsError{pErr.Error()})
+	args, err := parsePositionalArguments(msg.Params, callb.argTypes)
+	pSpanEnd(err)
+	if err != nil {
+		return msg.errorResponse(&invalidParamsError{err.Error()})
 	}
 	start := time.Now()
 
 	// Start tracing span before running the method.
 	rctx, _, rSpanEnd := telemetry.StartSpanWithTracer(ctx, h.tracer(), "rpc.runMethod")
 	answer := h.runMethod(rctx, msg, callb, args)
-	var rErr error
 	if answer.Error != nil {
-		rErr = errors.New(answer.Error.Message)
+		err = errors.New(answer.Error.Message)
 	}
-	rSpanEnd(&rErr)
+	rSpanEnd(err)
 
 	// Collect the statistics for RPC calls if metrics is enabled.
 	rpcRequestGauge.Inc(1)
@@ -625,7 +625,7 @@ func (h *handler) runMethod(ctx context.Context, msg *jsonrpcMessage, callb *cal
 	if response.Error != nil {
 		err = errors.New(response.Error.Message)
 	}
-	spanEnd(&err)
+	spanEnd(err)
 	return response
 }
 
