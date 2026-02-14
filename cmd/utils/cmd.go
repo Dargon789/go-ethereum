@@ -425,7 +425,7 @@ func ExportHistory(bc *core.BlockChain, dir string, first, last uint64, newBuild
 	if name, ok := params.NetworkNames[bc.Config().ChainID.String()]; ok {
 		network = name
 	}
-	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
+if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("error creating output directory: %w", err)
 	}
 
