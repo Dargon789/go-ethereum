@@ -17,6 +17,7 @@
 package core
 
 import (
+	"context"
 	"fmt"
 	"math/big"
 
@@ -63,7 +64,7 @@ func (b *BlockGen) SetCoinbase(addr common.Address) {
 		panic("coinbase can only be set once")
 	}
 	b.header.Coinbase = addr
-	b.gasPool = new(GasPool).AddGas(b.header.GasLimit)
+	b.gasPool = NewGasPool(b.header.GasLimit)
 }
 
 // SetExtra sets the extra data field of the generated block.
@@ -116,14 +117,16 @@ func (b *BlockGen) addTx(bc *BlockChain, vmConfig vm.Config, tx *types.Transacti
 		blockContext = NewEVMBlockContext(b.header, bc, &b.header.Coinbase)
 		evm          = vm.NewEVM(blockContext, b.statedb, b.cm.config, vmConfig)
 	)
-	b.statedb.SetTxContext(tx.Hash(), len(b.txs))
-	receipt, err := ApplyTransaction(evm, b.gasPool, b.statedb, b.header, tx, &b.header.GasUsed)
+	b.statedb.SetTxContext(tx.Hash(), len(b.txs), uint32(len(b.txs)+1))
+	receipt, err := ApplyTransaction(evm, b.gasPool, b.statedb, b.header, tx)
 	if err != nil {
 		panic(err)
 	}
+	b.header.GasUsed = b.gasPool.Used()
+
 	// Merge the tx-local access event into the "block-local" one, in order to collect
 	// all values, so that the witness can be built.
-	if b.statedb.Database().TrieDB().IsVerkle() {
+	if b.statedb.Database().Type().Is(state.TypeUBT) {
 		b.statedb.AccessEvents().Merge(evm.AccessEvents)
 	}
 	b.txs = append(b.txs, tx)
@@ -312,28 +315,17 @@ func (b *BlockGen) collectRequests(readonly bool) (requests [][]byte) {
 		// off the statedb before executing the system calls.
 		statedb = statedb.Copy()
 	}
+	var blockLogs []*types.Log
+	for _, r := range b.receipts {
+		blockLogs = append(blockLogs, r.Logs...)
+	}
+	// TODO use the shared EVM throughout the entire generation cycle
+	blockContext := NewEVMBlockContext(b.header, b.cm, &b.header.Coinbase)
+	evm := vm.NewEVM(blockContext, statedb, b.cm.config, vm.Config{})
 
-	if b.cm.config.IsPrague(b.header.Number, b.header.Time) {
-		requests = [][]byte{}
-		// EIP-6110 deposits
-		var blockLogs []*types.Log
-		for _, r := range b.receipts {
-			blockLogs = append(blockLogs, r.Logs...)
-		}
-		if err := ParseDepositLogs(&requests, blockLogs, b.cm.config); err != nil {
-			panic(fmt.Sprintf("failed to parse deposit log: %v", err))
-		}
-		// create EVM for system calls
-		blockContext := NewEVMBlockContext(b.header, b.cm, &b.header.Coinbase)
-		evm := vm.NewEVM(blockContext, statedb, b.cm.config, vm.Config{})
-		// EIP-7002
-		if err := ProcessWithdrawalQueue(&requests, evm); err != nil {
-			panic(fmt.Sprintf("could not process withdrawal requests: %v", err))
-		}
-		// EIP-7251
-		if err := ProcessConsolidationQueue(&requests, evm); err != nil {
-			panic(fmt.Sprintf("could not process consolidation requests: %v", err))
-		}
+	requests, err := PostExecution(context.Background(), b.cm.config, b.header.Number, b.header.Time, blockLogs, evm, uint32(len(b.txs)+1))
+	if err != nil {
+		panic(fmt.Sprintf("failed to run post-execution: %v", err))
 	}
 	return requests
 }
@@ -389,7 +381,7 @@ func GenerateChain(config *params.ChainConfig, parent *types.Block, engine conse
 			misc.ApplyDAOHardFork(statedb)
 		}
 
-		if config.IsPrague(b.header.Number, b.header.Time) || config.IsVerkle(b.header.Number, b.header.Time) {
+		if config.IsPrague(b.header.Number, b.header.Time) || config.IsUBT(b.header.Number, b.header.Time) {
 			// EIP-2935
 			blockContext := NewEVMBlockContext(b.header, cm, &b.header.Coinbase)
 			blockContext.Random = &common.Hash{} // enable post-merge instruction set
@@ -408,11 +400,22 @@ func GenerateChain(config *params.ChainConfig, parent *types.Block, engine conse
 			b.header.RequestsHash = &reqHash
 		}
 
-		body := types.Body{Transactions: b.txs, Uncles: b.uncles, Withdrawals: b.withdrawals}
-		block, err := b.engine.FinalizeAndAssemble(cm, b.header, statedb, &body, b.receipts)
-		if err != nil {
-			panic(err)
+		body := types.Body{
+			Transactions: b.txs,
+			Uncles:       b.uncles,
+			Withdrawals:  b.withdrawals,
 		}
+		if !config.IsShanghai(b.header.Number, b.header.Time) {
+			if body.Withdrawals != nil {
+				panic("unexpected withdrawal before shanghai")
+			}
+		} else {
+			if body.Withdrawals == nil {
+				body.Withdrawals = make([]*types.Withdrawal, 0)
+			}
+		}
+		// Assemble the block for delivery.
+		block := AssembleBlock(b.engine, cm, b.header, statedb, &body, b.receipts)
 
 		// Write state changes to db
 		root, err := statedb.Commit(b.header.Number.Uint64(), config.IsEIP158(b.header.Number), config.IsCancun(b.header.Number, b.header.Time))
@@ -427,8 +430,8 @@ func GenerateChain(config *params.ChainConfig, parent *types.Block, engine conse
 
 	// Forcibly use hash-based state scheme for retaining all nodes in disk.
 	var triedbConfig *triedb.Config = triedb.HashDefaults
-	if config.IsVerkle(config.ChainID, 0) {
-		triedbConfig = triedb.VerkleDefaults
+	if config.IsUBT(config.ChainID, 0) {
+		triedbConfig = triedb.UBTDefaults
 	}
 	triedb := triedb.NewDatabase(db, triedbConfig)
 	defer triedb.Close()
@@ -476,16 +479,17 @@ func GenerateChain(config *params.ChainConfig, parent *types.Block, engine conse
 func GenerateChainWithGenesis(genesis *Genesis, engine consensus.Engine, n int, gen func(int, *BlockGen)) (ethdb.Database, []*types.Block, []types.Receipts) {
 	db := rawdb.NewMemoryDatabase()
 	var triedbConfig *triedb.Config = triedb.HashDefaults
-	if genesis.Config != nil && genesis.Config.IsVerkle(genesis.Config.ChainID, 0) {
-		triedbConfig = triedb.VerkleDefaults
+	if genesis.Config != nil && genesis.Config.IsUBT(genesis.Config.ChainID, 0) {
+		triedbConfig = triedb.UBTDefaults
 	}
-	triedb := triedb.NewDatabase(db, triedbConfig)
-	defer triedb.Close()
-	_, err := genesis.Commit(db, triedb)
+	genesisTriedb := triedb.NewDatabase(db, triedbConfig)
+	block, err := genesis.Commit(db, genesisTriedb, nil)
 	if err != nil {
+		genesisTriedb.Close()
 		panic(err)
 	}
-	blocks, receipts := GenerateChain(genesis.Config, genesis.ToBlock(), engine, db, n, gen)
+	genesisTriedb.Close()
+	blocks, receipts := GenerateChain(genesis.Config, block, engine, db, n, gen)
 	return db, blocks, receipts
 }
 

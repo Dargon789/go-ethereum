@@ -18,6 +18,7 @@
 package catalyst
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"reflect"
@@ -30,13 +31,14 @@ import (
 	"github.com/ethereum/go-ethereum/beacon/engine"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
+	"github.com/ethereum/go-ethereum/internal/telemetry"
 	"github.com/ethereum/go-ethereum/internal/version"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/miner"
 	"github.com/ethereum/go-ethereum/node"
 	"github.com/ethereum/go-ethereum/params"
@@ -45,9 +47,10 @@ import (
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
-// Register adds the engine API to the full node.
+// Register adds the engine API and related APIs to the full node.
 func Register(stack *node.Node, backend *eth.Ethereum) error {
 	stack.RegisterAPIs([]rpc.API{
+		newTestingAPI(backend),
 		{
 			Namespace:     "engine",
 			Service:       NewConsensusAPI(backend),
@@ -79,20 +82,9 @@ const (
 	// beaconUpdateWarnFrequency is the frequency at which to warn the user that
 	// the beacon client is offline.
 	beaconUpdateWarnFrequency = 5 * time.Minute
-)
 
-var (
-	// Number of blobs requested via getBlobsV2
-	getBlobsRequestedCounter = metrics.NewRegisteredCounter("engine/getblobs/requested", nil)
-
-	// Number of blobs requested via getBlobsV2 that are present in the blobpool
-	getBlobsAvailableCounter = metrics.NewRegisteredCounter("engine/getblobs/available", nil)
-
-	// Number of times getBlobsV2 responded with “hit”
-	getBlobsV2RequestHit = metrics.NewRegisteredCounter("engine/getblobs/hit", nil)
-
-	// Number of times getBlobsV2 responded with “miss”
-	getBlobsV2RequestMiss = metrics.NewRegisteredCounter("engine/getblobs/miss", nil)
+	// maxReorgDepth is the maximum reorg depth accepted via forkchoiceUpdated.
+	maxReorgDepth = 32
 )
 
 type ConsensusAPI struct {
@@ -137,6 +129,9 @@ type ConsensusAPI struct {
 
 // NewConsensusAPI creates a new consensus api for the given backend.
 // The underlying blockchain needs to have a valid terminal total difficulty set.
+//
+// This function creates a long-lived object with an attached background thread.
+// For testing or other short-term use cases, please use newConsensusAPIWithoutHeartbeat.
 func NewConsensusAPI(eth *eth.Ethereum) *ConsensusAPI {
 	api := newConsensusAPIWithoutHeartbeat(eth)
 	go api.heartbeat()
@@ -170,7 +165,7 @@ func newConsensusAPIWithoutHeartbeat(eth *eth.Ethereum) *ConsensusAPI {
 //
 // If there are payloadAttributes: we try to assemble a block with the payloadAttributes
 // and return its payloadID.
-func (api *ConsensusAPI) ForkchoiceUpdatedV1(update engine.ForkchoiceStateV1, payloadAttributes *engine.PayloadAttributes) (engine.ForkChoiceResponse, error) {
+func (api *ConsensusAPI) ForkchoiceUpdatedV1(ctx context.Context, update engine.ForkchoiceStateV1, payloadAttributes *engine.PayloadAttributes) (engine.ForkChoiceResponse, error) {
 	if payloadAttributes != nil {
 		switch {
 		case payloadAttributes.Withdrawals != nil || payloadAttributes.BeaconRoot != nil:
@@ -179,12 +174,12 @@ func (api *ConsensusAPI) ForkchoiceUpdatedV1(update engine.ForkchoiceStateV1, pa
 			return engine.STATUS_INVALID, paramsErr("fcuV1 called post-shanghai")
 		}
 	}
-	return api.forkchoiceUpdated(update, payloadAttributes, engine.PayloadV1, false)
+	return api.forkchoiceUpdated(ctx, update, payloadAttributes, engine.PayloadV1, false)
 }
 
 // ForkchoiceUpdatedV2 is equivalent to V1 with the addition of withdrawals in the payload
 // attributes. It supports both PayloadAttributesV1 and PayloadAttributesV2.
-func (api *ConsensusAPI) ForkchoiceUpdatedV2(update engine.ForkchoiceStateV1, params *engine.PayloadAttributes) (engine.ForkChoiceResponse, error) {
+func (api *ConsensusAPI) ForkchoiceUpdatedV2(ctx context.Context, update engine.ForkchoiceStateV1, params *engine.PayloadAttributes) (engine.ForkChoiceResponse, error) {
 	if params != nil {
 		switch {
 		case params.BeaconRoot != nil:
@@ -197,12 +192,12 @@ func (api *ConsensusAPI) ForkchoiceUpdatedV2(update engine.ForkchoiceStateV1, pa
 			return engine.STATUS_INVALID, unsupportedForkErr("fcuV2 must only be called with paris or shanghai payloads")
 		}
 	}
-	return api.forkchoiceUpdated(update, params, engine.PayloadV2, false)
+	return api.forkchoiceUpdated(ctx, update, params, engine.PayloadV2, false)
 }
 
 // ForkchoiceUpdatedV3 is equivalent to V2 with the addition of parent beacon block root
 // in the payload attributes. It supports only PayloadAttributesV3.
-func (api *ConsensusAPI) ForkchoiceUpdatedV3(update engine.ForkchoiceStateV1, params *engine.PayloadAttributes) (engine.ForkChoiceResponse, error) {
+func (api *ConsensusAPI) ForkchoiceUpdatedV3(ctx context.Context, update engine.ForkchoiceStateV1, params *engine.PayloadAttributes) (engine.ForkChoiceResponse, error) {
 	if params != nil {
 		switch {
 		case params.Withdrawals == nil:
@@ -217,10 +212,35 @@ func (api *ConsensusAPI) ForkchoiceUpdatedV3(update engine.ForkchoiceStateV1, pa
 	// hash, even if params are wrong. To do this we need to split up
 	// forkchoiceUpdate into a function that only updates the head and then a
 	// function that kicks off block construction.
-	return api.forkchoiceUpdated(update, params, engine.PayloadV3, false)
+	return api.forkchoiceUpdated(ctx, update, params, engine.PayloadV3, false)
 }
 
-func (api *ConsensusAPI) forkchoiceUpdated(update engine.ForkchoiceStateV1, payloadAttributes *engine.PayloadAttributes, payloadVersion engine.PayloadVersion, payloadWitness bool) (engine.ForkChoiceResponse, error) {
+// ForkchoiceUpdatedV4 is equivalent to V3 with the addition of slot number
+// in the payload attributes. It supports only PayloadAttributesV4.
+func (api *ConsensusAPI) ForkchoiceUpdatedV4(ctx context.Context, update engine.ForkchoiceStateV1, params *engine.PayloadAttributes) (engine.ForkChoiceResponse, error) {
+	if params != nil {
+		switch {
+		case params.Withdrawals == nil:
+			return engine.STATUS_INVALID, attributesErr("missing withdrawals")
+		case params.BeaconRoot == nil:
+			return engine.STATUS_INVALID, attributesErr("missing beacon root")
+		case params.SlotNumber == nil:
+			return engine.STATUS_INVALID, attributesErr("missing slot number")
+		case !api.checkFork(params.Timestamp, forks.Amsterdam):
+			return engine.STATUS_INVALID, unsupportedForkErr("fcuV4 must only be called for amsterdam payloads")
+		}
+	}
+	// TODO(matt): the spec requires that fcu is applied when called on a valid
+	// hash, even if params are wrong. To do this we need to split up
+	// forkchoiceUpdate into a function that only updates the head and then a
+	// function that kicks off block construction.
+	return api.forkchoiceUpdated(ctx, update, params, engine.PayloadV4, false)
+}
+
+func (api *ConsensusAPI) forkchoiceUpdated(ctx context.Context, update engine.ForkchoiceStateV1, payloadAttributes *engine.PayloadAttributes, payloadVersion engine.PayloadVersion, payloadWitness bool) (result engine.ForkChoiceResponse, err error) {
+	ctx, _, spanEnd := telemetry.StartSpan(ctx, "engine.forkchoiceUpdated")
+	defer spanEnd(&err)
+
 	api.forkchoiceLock.Lock()
 	defer api.forkchoiceLock.Unlock()
 
@@ -241,12 +261,9 @@ func (api *ConsensusAPI) forkchoiceUpdated(update engine.ForkchoiceStateV1, payl
 		if res := api.checkInvalidAncestor(update.HeadBlockHash, update.HeadBlockHash); res != nil {
 			return engine.ForkChoiceResponse{PayloadStatus: *res, PayloadID: nil}, nil
 		}
-		// If the head hash is unknown (was not given to us in a newPayload request),
-		// we cannot resolve the header, so not much to do. This could be extended in
-		// the future to resolve from the `eth` network, but it's an unexpected case
-		// that should be fixed, not papered over.
 		header := api.remoteBlocks.get(update.HeadBlockHash)
 		if header == nil {
+			// The head hash is unknown locally, try to resolve it from the `eth` network
 			log.Warn("Fetching the unknown forkchoice head from network", "hash", update.HeadBlockHash)
 			retrievedHead, err := api.eth.Downloader().GetHeader(update.HeadBlockHash)
 			if err != nil {
@@ -259,7 +276,9 @@ func (api *ConsensusAPI) forkchoiceUpdated(update engine.ForkchoiceStateV1, payl
 		// If the finalized hash is known, we can direct the downloader to move
 		// potentially more data to the freezer from the get go.
 		finalized := api.remoteBlocks.get(update.FinalizedBlockHash)
-
+		if finalized == nil {
+			finalized = api.eth.BlockChain().GetHeaderByHash(update.FinalizedBlockHash)
+		}
 		// Header advertised via a past newPayload request. Start syncing to it.
 		context := []interface{}{"number", header.Number, "hash", header.Hash()}
 		if update.FinalizedBlockHash != (common.Hash{}) {
@@ -306,10 +325,23 @@ func (api *ConsensusAPI) forkchoiceUpdated(update engine.ForkchoiceStateV1, payl
 		// generating the payload. It's a special corner case that a few slots are
 		// missing and we are requested to generate the payload in slot.
 	} else {
-		// If the head block is already in our canonical chain, the beacon client is
-		// probably resyncing. Ignore the update.
-		log.Info("Ignoring beacon update to old head", "number", block.NumberU64(), "hash", update.HeadBlockHash, "age", common.PrettyAge(time.Unix(int64(block.Time()), 0)), "have", api.eth.BlockChain().CurrentBlock().Number)
-		return valid(nil), nil
+		if finalized := api.eth.BlockChain().CurrentFinalBlock(); finalized != nil && block.NumberU64() <= finalized.Number.Uint64() {
+			log.Info("Skipping beacon update to finalized ancestor", "number", block.NumberU64(), "hash", update.HeadBlockHash)
+			return valid(nil), nil
+		}
+		depth := api.eth.BlockChain().CurrentBlock().Number.Uint64() - block.NumberU64()
+		if depth >= maxReorgDepth {
+			log.Warn("Refusing too deep reorg", "depth", depth, "head", update.HeadBlockHash)
+			return engine.STATUS_INVALID, engine.TooDeepReorg.With(fmt.Errorf("reorg depth %d exceeds limit %d", depth, maxReorgDepth))
+		}
+		if !api.eth.Synced() {
+			log.Info("Ignoring beacon update to old head while syncing", "number", block.NumberU64(), "hash", update.HeadBlockHash)
+			return valid(nil), nil
+		}
+		if latestValid, err := api.eth.BlockChain().SetCanonical(block); err != nil {
+			log.Error("Error setting canonical", "number", block.NumberU64(), "hash", update.HeadBlockHash, "error", err)
+			return engine.ForkChoiceResponse{PayloadStatus: engine.PayloadStatusV1{Status: engine.INVALID, LatestValidHash: &latestValid}}, err
+		}
 	}
 	api.eth.SetSynced()
 
@@ -353,6 +385,7 @@ func (api *ConsensusAPI) forkchoiceUpdated(update engine.ForkchoiceStateV1, payl
 			Random:       payloadAttributes.Random,
 			Withdrawals:  payloadAttributes.Withdrawals,
 			BeaconRoot:   payloadAttributes.BeaconRoot,
+			SlotNum:      payloadAttributes.SlotNumber,
 			Version:      payloadVersion,
 		}
 		id := args.Id()
@@ -361,7 +394,7 @@ func (api *ConsensusAPI) forkchoiceUpdated(update engine.ForkchoiceStateV1, payl
 		if api.localBlocks.has(id) {
 			return valid(&id), nil
 		}
-		payload, err := api.eth.Miner().BuildPayload(args, payloadWitness)
+		payload, err := api.eth.Miner().BuildPayload(ctx, args, payloadWitness)
 		if err != nil {
 			log.Error("Failed to build payload", "err", err)
 			return valid(nil), engine.InvalidPayloadAttributes.With(err)
@@ -420,7 +453,7 @@ func (api *ConsensusAPI) GetPayloadV2(payloadID engine.PayloadID) (*engine.Execu
 		payloadID,
 		false,
 		[]engine.PayloadVersion{engine.PayloadV1, engine.PayloadV2},
-		[]forks.Fork{forks.Shanghai},
+		[]forks.Fork{forks.Paris, forks.Shanghai},
 	)
 }
 
@@ -463,6 +496,18 @@ func (api *ConsensusAPI) GetPayloadV5(payloadID engine.PayloadID) (*engine.Execu
 			forks.BPO3,
 			forks.BPO4,
 			forks.BPO5,
+		})
+}
+
+// GetPayloadV6 returns a cached payload by id. This endpoint should only
+// be used after the Amsterdam fork.
+func (api *ConsensusAPI) GetPayloadV6(payloadID engine.PayloadID) (*engine.ExecutionPayloadEnvelope, error) {
+	return api.getPayload(
+		payloadID,
+		false,
+		[]engine.PayloadVersion{engine.PayloadV4},
+		[]forks.Fork{
+			forks.Amsterdam,
 		})
 }
 
@@ -517,7 +562,7 @@ func (api *ConsensusAPI) GetBlobsV1(hashes []common.Hash) ([]*engine.BlobAndProo
 	if len(hashes) > 128 {
 		return nil, engine.TooLargeRequest.With(fmt.Errorf("requested blob count too large: %v", len(hashes)))
 	}
-	blobs, _, proofs, err := api.eth.BlobTxPool().GetBlobs(hashes, types.BlobSidecarVersion0, false)
+	blobs, _, proofs, err := api.eth.BlobTxPool().GetBlobs(hashes, types.BlobSidecarVersion0)
 	if err != nil {
 		return nil, engine.InvalidParams.With(err)
 	}
@@ -563,8 +608,25 @@ func (api *ConsensusAPI) GetBlobsV1(hashes []common.Hash) ([]*engine.BlobAndProo
 func (api *ConsensusAPI) GetBlobsV2(hashes []common.Hash) ([]*engine.BlobAndProofV2, error) {
 	head := api.eth.BlockChain().CurrentHeader()
 	if api.config().LatestFork(head.Time) < forks.Osaka {
-		return nil, unsupportedForkErr("engine_getBlobsV2 is not available before Osaka fork")
+		return nil, nil
 	}
+	return api.getBlobs(hashes, true)
+}
+
+// GetBlobsV3 returns a set of blobs from the transaction pool. Same as
+// GetBlobsV2, except will return partial responses in case there is a missing
+// blob.
+func (api *ConsensusAPI) GetBlobsV3(hashes []common.Hash) ([]*engine.BlobAndProofV2, error) {
+	head := api.eth.BlockChain().CurrentHeader()
+	if api.config().LatestFork(head.Time) < forks.Osaka {
+		return nil, nil
+	}
+	return api.getBlobs(hashes, false)
+}
+
+// getBlobs returns all available blobs. In v2, partial responses are not allowed,
+// while v3 supports partial responses.
+func (api *ConsensusAPI) getBlobs(hashes []common.Hash, v2 bool) ([]*engine.BlobAndProofV2, error) {
 	if len(hashes) > 128 {
 		return nil, engine.TooLargeRequest.With(fmt.Errorf("requested blob count too large: %v", len(hashes)))
 	}
@@ -572,28 +634,31 @@ func (api *ConsensusAPI) GetBlobsV2(hashes []common.Hash) ([]*engine.BlobAndProo
 	getBlobsRequestedCounter.Inc(int64(len(hashes)))
 	getBlobsAvailableCounter.Inc(int64(available))
 
-	// Optimization: check first if all blobs are available, if not, return empty response
-	if available != len(hashes) {
-		getBlobsV2RequestMiss.Inc(1)
+	// Short circuit if partial response is not allowed
+	if v2 && available != len(hashes) {
+		getBlobsRequestMiss.Inc(1)
 		return nil, nil
 	}
-
-	blobs, _, proofs, err := api.eth.BlobTxPool().GetBlobs(hashes, types.BlobSidecarVersion1, false)
+	// Retrieve blobs from the pool. This operation is expensive and may involve
+	// heavy disk I/O.
+	blobs, _, proofs, err := api.eth.BlobTxPool().GetBlobs(hashes, types.BlobSidecarVersion1)
 	if err != nil {
 		return nil, engine.InvalidParams.With(err)
 	}
-
-	// To comply with API spec, check again that we really got all data needed
-	for _, blob := range blobs {
-		if blob == nil {
-			getBlobsV2RequestMiss.Inc(1)
-			return nil, nil
-		}
-	}
-	getBlobsV2RequestHit.Inc(1)
-
+	// Validate the blobs from the pool and assemble the response
+	filled := 0
 	res := make([]*engine.BlobAndProofV2, len(hashes))
-	for i := 0; i < len(blobs); i++ {
+	for i := range blobs {
+		// The blob has been evicted since the last AvailableBlobs call.
+		// Return null if partial response is not allowed.
+		if blobs[i] == nil {
+			if !v2 {
+				continue
+			} else {
+				getBlobsRequestMiss.Inc(1)
+				return nil, nil
+			}
+		}
 		var cellProofs []hexutil.Bytes
 		for _, proof := range proofs[i] {
 			cellProofs = append(cellProofs, proof[:])
@@ -602,6 +667,14 @@ func (api *ConsensusAPI) GetBlobsV2(hashes []common.Hash) ([]*engine.BlobAndProo
 			Blob:       blobs[i][:],
 			CellProofs: cellProofs,
 		}
+		filled++
+	}
+	if filled == len(hashes) {
+		getBlobsRequestCompleteHit.Inc(1)
+	} else if filled > 0 {
+		getBlobsRequestPartialHit.Inc(1)
+	} else {
+		getBlobsRequestMiss.Inc(1)
 	}
 	return res, nil
 }
@@ -610,15 +683,15 @@ func (api *ConsensusAPI) GetBlobsV2(hashes []common.Hash) ([]*engine.BlobAndProo
 var invalidStatus = engine.PayloadStatusV1{Status: engine.INVALID}
 
 // NewPayloadV1 creates an Eth1 block, inserts it in the chain, and returns the status of the chain.
-func (api *ConsensusAPI) NewPayloadV1(params engine.ExecutableData) (engine.PayloadStatusV1, error) {
+func (api *ConsensusAPI) NewPayloadV1(ctx context.Context, params engine.ExecutableData) (engine.PayloadStatusV1, error) {
 	if params.Withdrawals != nil {
 		return invalidStatus, paramsErr("withdrawals not supported in V1")
 	}
-	return api.newPayload(params, nil, nil, nil, false)
+	return api.newPayload(ctx, params, nil, nil, nil, false)
 }
 
 // NewPayloadV2 creates an Eth1 block, inserts it in the chain, and returns the status of the chain.
-func (api *ConsensusAPI) NewPayloadV2(params engine.ExecutableData) (engine.PayloadStatusV1, error) {
+func (api *ConsensusAPI) NewPayloadV2(ctx context.Context, params engine.ExecutableData) (engine.PayloadStatusV1, error) {
 	var (
 		cancun   = api.config().IsCancun(api.config().LondonBlock, params.Timestamp)
 		shanghai = api.config().IsShanghai(api.config().LondonBlock, params.Timestamp)
@@ -635,11 +708,11 @@ func (api *ConsensusAPI) NewPayloadV2(params engine.ExecutableData) (engine.Payl
 	case params.BlobGasUsed != nil:
 		return invalidStatus, paramsErr("non-nil blobGasUsed pre-cancun")
 	}
-	return api.newPayload(params, nil, nil, nil, false)
+	return api.newPayload(ctx, params, nil, nil, nil, false)
 }
 
 // NewPayloadV3 creates an Eth1 block, inserts it in the chain, and returns the status of the chain.
-func (api *ConsensusAPI) NewPayloadV3(params engine.ExecutableData, versionedHashes []common.Hash, beaconRoot *common.Hash) (engine.PayloadStatusV1, error) {
+func (api *ConsensusAPI) NewPayloadV3(ctx context.Context, params engine.ExecutableData, versionedHashes []common.Hash, beaconRoot *common.Hash) (engine.PayloadStatusV1, error) {
 	switch {
 	case params.Withdrawals == nil:
 		return invalidStatus, paramsErr("nil withdrawals post-shanghai")
@@ -654,11 +727,11 @@ func (api *ConsensusAPI) NewPayloadV3(params engine.ExecutableData, versionedHas
 	case !api.checkFork(params.Timestamp, forks.Cancun):
 		return invalidStatus, unsupportedForkErr("newPayloadV3 must only be called for cancun payloads")
 	}
-	return api.newPayload(params, versionedHashes, beaconRoot, nil, false)
+	return api.newPayload(ctx, params, versionedHashes, beaconRoot, nil, false)
 }
 
 // NewPayloadV4 creates an Eth1 block, inserts it in the chain, and returns the status of the chain.
-func (api *ConsensusAPI) NewPayloadV4(params engine.ExecutableData, versionedHashes []common.Hash, beaconRoot *common.Hash, executionRequests []hexutil.Bytes) (engine.PayloadStatusV1, error) {
+func (api *ConsensusAPI) NewPayloadV4(ctx context.Context, params engine.ExecutableData, versionedHashes []common.Hash, beaconRoot *common.Hash, executionRequests []hexutil.Bytes) (engine.PayloadStatusV1, error) {
 	switch {
 	case params.Withdrawals == nil:
 		return invalidStatus, paramsErr("nil withdrawals post-shanghai")
@@ -679,10 +752,37 @@ func (api *ConsensusAPI) NewPayloadV4(params engine.ExecutableData, versionedHas
 	if err := validateRequests(requests); err != nil {
 		return engine.PayloadStatusV1{Status: engine.INVALID}, engine.InvalidParams.With(err)
 	}
-	return api.newPayload(params, versionedHashes, beaconRoot, requests, false)
+	return api.newPayload(ctx, params, versionedHashes, beaconRoot, requests, false)
 }
 
-func (api *ConsensusAPI) newPayload(params engine.ExecutableData, versionedHashes []common.Hash, beaconRoot *common.Hash, requests [][]byte, witness bool) (engine.PayloadStatusV1, error) {
+// NewPayloadV5 creates an Eth1 block, inserts it in the chain, and returns the status of the chain.
+func (api *ConsensusAPI) NewPayloadV5(ctx context.Context, params engine.ExecutableData, versionedHashes []common.Hash, beaconRoot *common.Hash, executionRequests []hexutil.Bytes) (engine.PayloadStatusV1, error) {
+	switch {
+	case params.Withdrawals == nil:
+		return invalidStatus, paramsErr("nil withdrawals post-shanghai")
+	case params.ExcessBlobGas == nil:
+		return invalidStatus, paramsErr("nil excessBlobGas post-cancun")
+	case params.BlobGasUsed == nil:
+		return invalidStatus, paramsErr("nil blobGasUsed post-cancun")
+	case versionedHashes == nil:
+		return invalidStatus, paramsErr("nil versionedHashes post-cancun")
+	case beaconRoot == nil:
+		return invalidStatus, paramsErr("nil beaconRoot post-cancun")
+	case executionRequests == nil:
+		return invalidStatus, paramsErr("nil executionRequests post-prague")
+	case params.SlotNumber == nil:
+		return invalidStatus, paramsErr("nil slotnumber post-amsterdam")
+	case !api.checkFork(params.Timestamp, forks.Amsterdam):
+		return invalidStatus, unsupportedForkErr("newPayloadV5 must only be called for amsterdam payloads")
+	}
+	requests := convertRequests(executionRequests)
+	if err := validateRequests(requests); err != nil {
+		return engine.PayloadStatusV1{Status: engine.INVALID}, engine.InvalidParams.With(err)
+	}
+	return api.newPayload(ctx, params, versionedHashes, beaconRoot, requests, false)
+}
+
+func (api *ConsensusAPI) newPayload(ctx context.Context, params engine.ExecutableData, versionedHashes []common.Hash, beaconRoot *common.Hash, requests [][]byte, witness bool) (result engine.PayloadStatusV1, err error) {
 	// The locking here is, strictly, not required. Without these locks, this can happen:
 	//
 	// 1. NewPayload( execdata-N ) is invoked from the CL. It goes all the way down to
@@ -696,6 +796,13 @@ func (api *ConsensusAPI) newPayload(params engine.ExecutableData, versionedHashe
 	//    sequentially.
 	// Hence, we use a lock here, to be sure that the previous call has finished before we
 	// check whether we already have the block locally.
+	var attrs = []telemetry.Attribute{
+		telemetry.Int64Attribute("block.number", int64(params.Number)),
+		telemetry.StringAttribute("block.hash", params.BlockHash.Hex()),
+		telemetry.Int64Attribute("tx.count", int64(len(params.Transactions))),
+	}
+	ctx, _, spanEnd := telemetry.StartSpan(ctx, "engine.newPayload", attrs...)
+	defer spanEnd(&err)
 	api.newPayloadLock.Lock()
 	defer api.newPayloadLock.Unlock()
 
@@ -709,6 +816,10 @@ func (api *ConsensusAPI) newPayload(params engine.ExecutableData, versionedHashe
 		ebg := "nil"
 		if params.ExcessBlobGas != nil {
 			ebg = strconv.Itoa(int(*params.ExcessBlobGas))
+		}
+		slotNum := "nil"
+		if params.SlotNumber != nil {
+			slotNum = strconv.Itoa(int(*params.SlotNumber))
 		}
 		log.Warn("Invalid NewPayload params",
 			"params.Number", params.Number,
@@ -725,6 +836,7 @@ func (api *ConsensusAPI) newPayload(params engine.ExecutableData, versionedHashe
 			"params.BaseFeePerGas", params.BaseFeePerGas,
 			"params.BlobGasUsed", bgu,
 			"params.ExcessBlobGas", ebg,
+			"params.SlotNumber", slotNum,
 			"len(params.Transactions)", len(params.Transactions),
 			"len(params.Withdrawals)", len(params.Withdrawals),
 			"beaconRoot", beaconRoot,
@@ -757,7 +869,7 @@ func (api *ConsensusAPI) newPayload(params engine.ExecutableData, versionedHashe
 		return api.delayPayloadImport(block), nil
 	}
 	if block.Time() <= parent.Time() {
-		log.Warn("Invalid timestamp", "parent", block.Time(), "block", block.Time())
+		log.Warn("Invalid timestamp", "parent", parent.Time(), "block", block.Time())
 		return api.invalid(errors.New("invalid timestamp"), parent.Header()), nil
 	}
 	// Another corner case: if the node is in snap sync mode, but the CL client
@@ -773,7 +885,9 @@ func (api *ConsensusAPI) newPayload(params engine.ExecutableData, versionedHashe
 		return engine.PayloadStatusV1{Status: engine.ACCEPTED}, nil
 	}
 	log.Trace("Inserting block without sethead", "hash", block.Hash(), "number", block.Number())
-	proofs, err := api.eth.BlockChain().InsertBlockWithoutSetHead(block, witness)
+	start := time.Now()
+	proofs, err := api.eth.BlockChain().InsertBlockWithoutSetHead(ctx, block, witness)
+	processingTime := time.Since(start)
 	if err != nil {
 		log.Warn("NewPayload: inserting block failed", "error", err)
 
@@ -785,6 +899,13 @@ func (api *ConsensusAPI) newPayload(params engine.ExecutableData, versionedHashe
 		return api.invalid(err, parent.Header()), nil
 	}
 	hash := block.Hash()
+
+	// Emit NewPayloadEvent for ethstats reporting
+	api.eth.BlockChain().SendNewPayloadEvent(core.NewPayloadEvent{
+		Hash:           hash,
+		Number:         block.NumberU64(),
+		ProcessingTime: processingTime,
+	})
 
 	// If witness collection was requested, inject that into the result too
 	var ow *hexutil.Bytes
@@ -818,7 +939,7 @@ func (api *ConsensusAPI) delayPayloadImport(block *types.Block) engine.PayloadSt
 		return engine.PayloadStatusV1{Status: engine.SYNCING}
 	}
 	// Either no beacon sync was started yet, or it rejected the delivered
-	// payload as non-integratable on top of the existing sync. We'll just
+	// payload as non-integrate on top of the existing sync. We'll just
 	// have to rely on the beacon client to forcefully update the head with
 	// a forkchoice update request.
 	if api.eth.Downloader().ConfigSyncMode() == ethconfig.FullSync {
@@ -916,8 +1037,6 @@ func (api *ConsensusAPI) invalid(err error, latestValid *types.Header) engine.Pa
 // heartbeat loops indefinitely, and checks if there have been beacon client updates
 // received in the last while. If not - or if they but strange ones - it warns the
 // user that something might be off with their consensus node.
-//
-// TODO(karalabe): Spin this goroutine down somehow
 func (api *ConsensusAPI) heartbeat() {
 	// Sleep a bit on startup since there's obviously no beacon client yet
 	// attached, so no need to print scary warnings to the user.
