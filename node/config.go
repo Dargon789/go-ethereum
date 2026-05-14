@@ -83,7 +83,7 @@ type Config struct {
 	// scrypt KDF at the expense of security.
 	UseLightweightKDF bool `toml:",omitempty"`
 
-	// InsecureUnlockAllowed allows user to unlock accounts in unsafe http environment.
+	// InsecureUnlockAllowed is a deprecated option to  allow users to accounts in unsafe http environment.
 	InsecureUnlockAllowed bool `toml:",omitempty"`
 
 	// NoUSB disables hardware wallet monitoring and connectivity.
@@ -191,9 +191,7 @@ type Config struct {
 	GraphQLVirtualHosts []string `toml:",omitempty"`
 
 	// Logger is a custom logger to use with the p2p.Server.
-	Logger log.Logger `toml:",omitempty"`
-
-	oldGethResourceWarning bool
+	Logger log.Logger `toml:"-,omitempty"`
 
 	// AllowUnprotectedTxs allows non EIP-155 protected transactions to be send over RPC.
 	AllowUnprotectedTxs bool `toml:",omitempty"`
@@ -210,7 +208,29 @@ type Config struct {
 	// EnablePersonal enables the deprecated personal namespace.
 	EnablePersonal bool `toml:"-"`
 
+	// Configures database engine used by the node.
 	DBEngine string `toml:",omitempty"`
+
+	// Configures OpenTelemetry reporting.
+	OpenTelemetry OpenTelemetryConfig `toml:",omitempty"`
+
+	oldGethResourceWarning bool
+}
+
+// OpenTelemetryConfig has settings for
+type OpenTelemetryConfig struct {
+	Enabled bool `toml:",omitempty"`
+
+	Tags       string `toml:",omitempty"`
+	InstanceID string `toml:",omitempty"`
+
+	// Exporter endpoint.
+	Endpoint     string `toml:",omitempty"`
+	AuthUser     string `toml:",omitempty"`
+	AuthPassword string `toml:",omitempty"`
+
+	// Percentage of sampled traces.
+	SampleRatio float64 `toml:",omitempty"`
 }
 
 // IPCEndpoint resolves an IPC endpoint based on a configured value, taking into

@@ -29,10 +29,10 @@ import (
 )
 
 var (
-	contextType      = reflect.TypeOf((*context.Context)(nil)).Elem()
-	errorType        = reflect.TypeOf((*error)(nil)).Elem()
-	subscriptionType = reflect.TypeOf(Subscription{})
-	stringType       = reflect.TypeOf("")
+	contextType      = reflect.TypeFor[context.Context]()
+	errorType        = reflect.TypeFor[error]()
+	subscriptionType = reflect.TypeFor[Subscription]()
+	stringType       = reflect.TypeFor[string]()
 )
 
 type serviceRegistry struct {
@@ -92,14 +92,14 @@ func (r *serviceRegistry) registerName(name string, rcvr interface{}) error {
 }
 
 // callback returns the callback corresponding to the given RPC method name.
-func (r *serviceRegistry) callback(method string) *callback {
+func (r *serviceRegistry) callback(method string) (cb *callback, service, methodName string) {
 	before, after, found := strings.Cut(method, serviceMethodSeparator)
 	if !found {
-		return nil
+		return nil, "", ""
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.services[before].callbacks[after]
+	return r.services[before].callbacks[after], before, after
 }
 
 // subscription returns a subscription callback in the given service.
@@ -110,7 +110,7 @@ func (r *serviceRegistry) subscription(service, name string) *callback {
 }
 
 // suitableCallbacks iterates over the methods of the given type. It determines if a method
-// satisfies the criteria for a RPC callback or a subscription callback and adds it to the
+// satisfies the criteria for an RPC callback or a subscription callback and adds it to the
 // collection of callbacks. See server documentation for a summary of these criteria.
 func suitableCallbacks(receiver reflect.Value) map[string]*callback {
 	typ := receiver.Type()
@@ -227,7 +227,7 @@ func isSubscriptionType(t reflect.Type) bool {
 	return t == subscriptionType
 }
 
-// isPubSub tests whether the given method has as as first argument a context.Context and
+// isPubSub tests whether the given method's first argument is a context.Context and
 // returns the pair (Subscription, error).
 func isPubSub(methodType reflect.Type) bool {
 	// numIn(0) is the receiver type

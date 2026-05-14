@@ -32,7 +32,6 @@ import (
 )
 
 var (
-	ErrBadResult                 = errors.New("bad result in JSON-RPC response")
 	ErrClientQuit                = errors.New("client is closed")
 	ErrNoResult                  = errors.New("JSON-RPC response has no result")
 	ErrMissingBatchResponse      = errors.New("response batch did not contain a response to this call")
@@ -45,6 +44,7 @@ var (
 const (
 	defaultDialTimeout = 10 * time.Second // used if context has no deadline
 	subscribeTimeout   = 10 * time.Second // overall timeout eth_subscribe, rpc_modules calls
+	unsubscribeTimeout = 10 * time.Second // timeout for *_unsubscribe calls
 )
 
 const (
@@ -70,7 +70,7 @@ type BatchElem struct {
 	// discarded.
 	Result interface{}
 	// Error is set if the server returns an error for this request, or if
-	// unmarshaling into Result fails. It is not set for I/O errors.
+	// unmarshalling into Result fails. It is not set for I/O errors.
 	Error error
 }
 
@@ -119,7 +119,7 @@ func (c *Client) newClientConn(conn ServerCodec) *clientConn {
 	ctx := context.Background()
 	ctx = context.WithValue(ctx, clientContextKey{}, c)
 	ctx = context.WithValue(ctx, peerInfoContextKey{}, conn.peerInfo())
-	handler := newHandler(ctx, conn, c.idgen, c.services, c.batchItemLimit, c.batchResponseMaxSize)
+	handler := newHandler(ctx, conn, c.idgen, c.services, c.batchItemLimit, c.batchResponseMaxSize, nil)
 	return &clientConn{conn, handler}
 }
 
@@ -431,7 +431,7 @@ func (c *Client) BatchCallContext(ctx context.Context, b []BatchElem) error {
 	}
 
 	// Wait for all responses to come back.
-	for n := 0; n < len(batchresp) && err == nil; n++ {
+	for n := 0; n < len(batchresp); n++ {
 		resp := batchresp[n]
 		if resp == nil {
 			// Ignore null responses. These can happen for batches sent via HTTP.
@@ -484,12 +484,6 @@ func (c *Client) Notify(ctx context.Context, method string, args ...interface{})
 // EthSubscribe registers a subscription under the "eth" namespace.
 func (c *Client) EthSubscribe(ctx context.Context, channel interface{}, args ...interface{}) (*ClientSubscription, error) {
 	return c.Subscribe(ctx, "eth", channel, args...)
-}
-
-// ShhSubscribe registers a subscription under the "shh" namespace.
-// Deprecated: use Subscribe(ctx, "shh", ...).
-func (c *Client) ShhSubscribe(ctx context.Context, channel interface{}, args ...interface{}) (*ClientSubscription, error) {
-	return c.Subscribe(ctx, "shh", channel, args...)
 }
 
 // Subscribe calls the "<namespace>_subscribe" method with the given arguments,

@@ -60,7 +60,7 @@ func (s *Server) WebsocketHandler(allowedOrigins []string) http.Handler {
 			log.Debug("WebSocket upgrade failed", "err", err)
 			return
 		}
-		codec := newWebsocketCodec(conn, r.Host, r.Header, wsDefaultReadLimit)
+		codec := newWebsocketCodec(conn, r.Host, r.Header, s.wsReadLimit)
 		s.ServeCodec(codec, 0)
 	})
 }
@@ -120,6 +120,10 @@ func (e wsHandshakeError) Error() string {
 		s += " (HTTP status " + e.status + ")"
 	}
 	return s
+}
+
+func (e wsHandshakeError) Unwrap() error {
+	return e.err
 }
 
 func originIsAllowed(allowedOrigins mapset.Set[string], browserOrigin string) bool {
@@ -320,6 +324,16 @@ func newWebsocketCodec(conn *websocket.Conn, host string, req http.Header, readL
 }
 
 func (wc *websocketCodec) close() {
+	// Send a WebSocket Close frame before closing the underlying connection,
+	// so the server sees a clean 1000 (normal closure) instead of 1006 (abnormal).
+	wc.jsonCodec.encMu.Lock()
+	wc.conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+		time.Now().Add(wsPingWriteTimeout),
+	)
+	wc.jsonCodec.encMu.Unlock()
+
 	wc.jsonCodec.close()
 	wc.wg.Wait()
 }

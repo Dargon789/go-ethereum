@@ -53,7 +53,8 @@ func (s *Suite) dial() (*Conn, error) {
 // dialAs attempts to dial a given node and perform a handshake using the given
 // private key.
 func (s *Suite) dialAs(key *ecdsa.PrivateKey) (*Conn, error) {
-	fd, err := net.Dial("tcp", fmt.Sprintf("%v:%d", s.Dest.IP(), s.Dest.TCP()))
+	tcpEndpoint, _ := s.Dest.TCPEndpoint()
+	fd, err := net.Dial("tcp", tcpEndpoint.String())
 	if err != nil {
 		return nil, err
 	}
@@ -65,10 +66,10 @@ func (s *Suite) dialAs(key *ecdsa.PrivateKey) (*Conn, error) {
 		return nil, err
 	}
 	conn.caps = []p2p.Cap{
-		{Name: "eth", Version: 67},
-		{Name: "eth", Version: 68},
+		{Name: "eth", Version: 70},
+		{Name: "eth", Version: 69},
 	}
-	conn.ourHighestProtoVersion = 68
+	conn.ourHighestProtoVersion = 70
 	return &conn, nil
 }
 
@@ -129,11 +130,16 @@ func (c *Conn) Write(proto Proto, code uint64, msg any) error {
 	return err
 }
 
+var errDisc error = errors.New("disconnect")
+
 // ReadEth reads an Eth sub-protocol wire message.
 func (c *Conn) ReadEth() (any, error) {
 	c.SetReadDeadline(time.Now().Add(timeout))
 	for {
 		code, data, _, err := c.Conn.Read()
+		if code == discMsg {
+			return nil, errDisc
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -159,10 +165,6 @@ func (c *Conn) ReadEth() (any, error) {
 			msg = new(eth.GetBlockBodiesPacket)
 		case eth.BlockBodiesMsg:
 			msg = new(eth.BlockBodiesPacket)
-		case eth.NewBlockMsg:
-			msg = new(eth.NewBlockPacket)
-		case eth.NewBlockHashesMsg:
-			msg = new(eth.NewBlockHashesPacket)
 		case eth.TransactionsMsg:
 			msg = new(eth.TransactionsPacket)
 		case eth.NewPooledTransactionHashesMsg:
@@ -221,6 +223,18 @@ func (c *Conn) ReadSnap() (any, error) {
 		}
 		return msg, nil
 	}
+}
+
+// dialAndPeer creates a peer connection and runs the handshake.
+func (s *Suite) dialAndPeer(status *eth.StatusPacket) (*Conn, error) {
+	c, err := s.dial()
+	if err != nil {
+		return nil, err
+	}
+	if err = c.peer(s.chain, status); err != nil {
+		c.Close()
+	}
+	return c, err
 }
 
 // peer performs both the protocol handshake and the status message
@@ -311,20 +325,23 @@ loop:
 			if err := rlp.DecodeBytes(data, &msg); err != nil {
 				return fmt.Errorf("error decoding status packet: %w", err)
 			}
-			if have, want := msg.Head, chain.blocks[chain.Len()-1].Hash(); have != want {
-				return fmt.Errorf("wrong head block in status, want:  %#x (block %d) have %#x",
-					want, chain.blocks[chain.Len()-1].NumberU64(), have)
+			if have, want := msg.LatestBlock, chain.blocks[chain.Len()-1].NumberU64(); have != want {
+				return fmt.Errorf("wrong head block in status, want: %d, have %d",
+					want, have)
 			}
-			if have, want := msg.TD.Cmp(chain.TD()), 0; have != want {
-				return fmt.Errorf("wrong TD in status: have %v want %v", have, want)
+			if have, want := msg.LatestBlockHash, chain.blocks[chain.Len()-1].Hash(); have != want {
+				return fmt.Errorf("wrong head block in status, want: %#x (block %d) have %#x",
+					want, chain.blocks[chain.Len()-1].NumberU64(), have)
 			}
 			if have, want := msg.ForkID, chain.ForkID(); !reflect.DeepEqual(have, want) {
 				return fmt.Errorf("wrong fork ID in status: have %v, want %v", have, want)
 			}
-			if have, want := msg.ProtocolVersion, c.ourHighestProtoVersion; have != uint32(want) {
-				return fmt.Errorf("wrong protocol version: have %v, want %v", have, want)
+			for _, cap := range c.caps {
+				if cap.Name == "eth" && cap.Version == uint(msg.ProtocolVersion) {
+					break loop
+				}
 			}
-			break loop
+			return fmt.Errorf("wrong protocol version: have %v, want %v", msg.ProtocolVersion, c.caps)
 		case discMsg:
 			var msg []p2p.DiscReason
 			if rlp.DecodeBytes(data, &msg); len(msg) == 0 {
@@ -348,10 +365,11 @@ loop:
 		status = &eth.StatusPacket{
 			ProtocolVersion: uint32(c.negotiatedProtoVersion),
 			NetworkID:       chain.config.ChainID.Uint64(),
-			TD:              chain.TD(),
-			Head:            chain.blocks[chain.Len()-1].Hash(),
 			Genesis:         chain.blocks[0].Hash(),
 			ForkID:          chain.ForkID(),
+			EarliestBlock:   0,
+			LatestBlock:     chain.blocks[chain.Len()-1].NumberU64(),
+			LatestBlockHash: chain.blocks[chain.Len()-1].Hash(),
 		}
 	}
 	if err := c.Write(ethProto, eth.StatusMsg, status); err != nil {

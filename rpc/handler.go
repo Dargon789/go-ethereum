@@ -17,15 +17,21 @@
 package rpc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/internal/telemetry"
 	"github.com/ethereum/go-ethereum/log"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // handler handles JSON-RPC messages. There is one handler per connection. Note that
@@ -62,6 +68,7 @@ type handler struct {
 	allowSubscribe       bool
 	batchRequestLimit    int
 	batchResponseMaxSize int
+	tracerProvider       trace.TracerProvider
 
 	subLock    sync.Mutex
 	serverSubs map[ID]*Subscription
@@ -70,9 +77,10 @@ type handler struct {
 type callProc struct {
 	ctx       context.Context
 	notifiers []*Notifier
+	isBatch   bool
 }
 
-func newHandler(connCtx context.Context, conn jsonWriter, idgen func() ID, reg *serviceRegistry, batchRequestLimit, batchResponseMaxSize int) *handler {
+func newHandler(connCtx context.Context, conn jsonWriter, idgen func() ID, reg *serviceRegistry, batchRequestLimit, batchResponseMaxSize int, tracerProvider trace.TracerProvider) *handler {
 	rootCtx, cancelRoot := context.WithCancel(connCtx)
 	h := &handler{
 		reg:                  reg,
@@ -87,6 +95,7 @@ func newHandler(connCtx context.Context, conn jsonWriter, idgen func() ID, reg *
 		log:                  log.Root(),
 		batchRequestLimit:    batchRequestLimit,
 		batchResponseMaxSize: batchResponseMaxSize,
+		tracerProvider:       tracerProvider,
 	}
 	if conn.remoteAddr() != "" {
 		h.log = h.log.New("conn", conn.remoteAddr())
@@ -194,6 +203,7 @@ func (h *handler) handleBatch(msgs []*jsonrpcMessage) {
 
 	// Process calls on a goroutine because they may block indefinitely:
 	h.startCallProc(func(cp *callProc) {
+		cp.isBatch = true
 		var (
 			timer      *time.Timer
 			cancel     context.CancelFunc
@@ -324,7 +334,7 @@ func (h *handler) addRequestOp(op *requestOp) {
 	}
 }
 
-// removeRequestOps stops waiting for the given request IDs.
+// removeRequestOp stops waiting for the given request IDs.
 func (h *handler) removeRequestOp(op *requestOp) {
 	for _, id := range op.ids {
 		delete(h.respWait, string(id))
@@ -388,7 +398,7 @@ func (h *handler) startCallProc(fn func(*callProc)) {
 	}()
 }
 
-// handleResponse processes method call responses.
+// handleResponses processes method call responses.
 func (h *handler) handleResponses(batch []*jsonrpcMessage, handleCall func(*jsonrpcMessage)) {
 	var resolvedops []*requestOp
 	handleResp := func(msg *jsonrpcMessage) {
@@ -468,16 +478,16 @@ func (h *handler) handleCallMsg(ctx *callProc, msg *jsonrpcMessage) *jsonrpcMess
 
 	case msg.isCall():
 		resp := h.handleCall(ctx, msg)
-		var ctx []interface{}
-		ctx = append(ctx, "reqid", idForLog{msg.ID}, "duration", time.Since(start))
+		var logctx []any
+		logctx = append(logctx, "reqid", idForLog{msg.ID}, "duration", time.Since(start))
 		if resp.Error != nil {
-			ctx = append(ctx, "err", resp.Error.Message)
+			logctx = append(logctx, "err", resp.Error.Message)
 			if resp.Error.Data != nil {
-				ctx = append(ctx, "errdata", resp.Error.Data)
+				logctx = append(logctx, "errdata", formatErrorData(resp.Error.Data))
 			}
-			h.log.Warn("Served "+msg.Method, ctx...)
+			h.log.Warn("Served "+msg.Method, logctx...)
 		} else {
-			h.log.Debug("Served "+msg.Method, ctx...)
+			h.log.Debug("Served "+msg.Method, logctx...)
 		}
 		return resp
 
@@ -494,36 +504,65 @@ func (h *handler) handleCall(cp *callProc, msg *jsonrpcMessage) *jsonrpcMessage 
 	if msg.isSubscribe() {
 		return h.handleSubscribe(cp, msg)
 	}
-	var callb *callback
 	if msg.isUnsubscribe() {
-		callb = h.unsubscribeCb
-	} else {
-		callb = h.reg.callback(msg.Method)
+		args, err := parsePositionalArguments(msg.Params, h.unsubscribeCb.argTypes)
+		if err != nil {
+			return msg.errorResponse(&invalidParamsError{err.Error()})
+		}
+		return h.runMethod(cp.ctx, msg, h.unsubscribeCb, args)
 	}
+
+	// Check method name length
+	if len(msg.Method) > maxMethodNameLength {
+		return msg.errorResponse(&invalidRequestError{fmt.Sprintf("method name too long: %d > %d", len(msg.Method), maxMethodNameLength)})
+	}
+	callb, service, method := h.reg.callback(msg.Method)
+
+	// If the method is not found, return an error.
 	if callb == nil {
 		return msg.errorResponse(&methodNotFoundError{method: msg.Method})
 	}
 
-	args, err := parsePositionalArguments(msg.Params, callb.argTypes)
-	if err != nil {
-		return msg.errorResponse(&invalidParamsError{err.Error()})
+	// Start root span for the request.
+	rpcInfo := telemetry.RPCInfo{
+		System:    "jsonrpc",
+		Service:   service,
+		Method:    method,
+		RequestID: string(msg.ID),
+	}
+	attrib := []telemetry.Attribute{
+		telemetry.BoolAttribute("rpc.batch", cp.isBatch),
+	}
+	ctx, spanEnd := telemetry.StartServerSpan(cp.ctx, h.tracer(), rpcInfo, attrib...)
+	defer spanEnd(nil) // don't propagate errors to parent spans
+
+	// Start tracing span before parsing arguments.
+	_, _, pSpanEnd := telemetry.StartSpanWithTracer(ctx, h.tracer(), "rpc.parsePositionalArguments")
+	args, pErr := parsePositionalArguments(msg.Params, callb.argTypes)
+	pSpanEnd(&pErr)
+	if pErr != nil {
+		return msg.errorResponse(&invalidParamsError{pErr.Error()})
 	}
 	start := time.Now()
-	answer := h.runMethod(cp.ctx, msg, callb, args)
+
+	// Start tracing span before running the method.
+	rctx, _, rSpanEnd := telemetry.StartSpanWithTracer(ctx, h.tracer(), "rpc.runMethod")
+	answer := h.runMethod(rctx, msg, callb, args)
+	var rErr error
+	if answer.Error != nil {
+		rErr = errors.New(answer.Error.Message)
+	}
+	rSpanEnd(&rErr)
 
 	// Collect the statistics for RPC calls if metrics is enabled.
-	// We only care about pure rpc call. Filter out subscription.
-	if callb != h.unsubscribeCb {
-		rpcRequestGauge.Inc(1)
-		if answer.Error != nil {
-			failedRequestGauge.Inc(1)
-		} else {
-			successfulRequestGauge.Inc(1)
-		}
-		rpcServingTimer.UpdateSince(start)
-		updateServeTimeHistogram(msg.Method, answer.Error == nil, time.Since(start))
+	rpcRequestGauge.Inc(1)
+	if answer.Error != nil {
+		failedRequestGauge.Inc(1)
+	} else {
+		successfulRequestGauge.Inc(1)
 	}
-
+	rpcServingTimer.UpdateSince(start)
+	updateServeTimeHistogram(msg.Method, answer.Error == nil, time.Since(start))
 	return answer
 }
 
@@ -531,6 +570,11 @@ func (h *handler) handleCall(cp *callProc, msg *jsonrpcMessage) *jsonrpcMessage 
 func (h *handler) handleSubscribe(cp *callProc, msg *jsonrpcMessage) *jsonrpcMessage {
 	if !h.allowSubscribe {
 		return msg.errorResponse(ErrNotificationsUnsupported)
+	}
+
+	// Check method name length
+	if len(msg.Method) > maxMethodNameLength {
+		return msg.errorResponse(&invalidRequestError{fmt.Sprintf("subscription name too long: %d > %d", len(msg.Method), maxMethodNameLength)})
 	}
 
 	// Subscription method name is first argument.
@@ -556,17 +600,33 @@ func (h *handler) handleSubscribe(cp *callProc, msg *jsonrpcMessage) *jsonrpcMes
 	n := &Notifier{h: h, namespace: namespace}
 	cp.notifiers = append(cp.notifiers, n)
 	ctx := context.WithValue(cp.ctx, notifierKey{}, n)
-
 	return h.runMethod(ctx, msg, callb, args)
 }
 
+// tracer returns the OpenTelemetry Tracer for RPC call tracing.
+func (h *handler) tracer() trace.Tracer {
+	if h.tracerProvider == nil {
+		// Default to global TracerProvider if none is set.
+		// Note: If no TracerProvider is set, the default is a no-op TracerProvider.
+		// See https://pkg.go.dev/go.opentelemetry.io/otel#GetTracerProvider
+		return otel.Tracer("")
+	}
+	return h.tracerProvider.Tracer("")
+}
+
 // runMethod runs the Go callback for an RPC method.
-func (h *handler) runMethod(ctx context.Context, msg *jsonrpcMessage, callb *callback, args []reflect.Value) *jsonrpcMessage {
+func (h *handler) runMethod(ctx context.Context, msg *jsonrpcMessage, callb *callback, args []reflect.Value, attributes ...telemetry.Attribute) *jsonrpcMessage {
 	result, err := callb.call(ctx, msg.Method, args)
 	if err != nil {
 		return msg.errorResponse(err)
 	}
-	return msg.response(result)
+	_, _, spanEnd := telemetry.StartSpanWithTracer(ctx, h.tracer(), "rpc.encodeJSONResponse", attributes...)
+	response := msg.response(result)
+	if response.Error != nil {
+		err = errors.New(response.Error.Message)
+	}
+	spanEnd(&err)
+	return response
 }
 
 // unsubscribe is the callback function for all *_unsubscribe calls.
@@ -590,4 +650,37 @@ func (id idForLog) String() string {
 		return s
 	}
 	return string(id.RawMessage)
+}
+
+var errTruncatedOutput = errors.New("truncated output")
+
+type limitedBuffer struct {
+	output []byte
+	limit  int
+}
+
+func (buf *limitedBuffer) Write(data []byte) (int, error) {
+	avail := buf.limit - len(buf.output)
+	if avail <= 0 {
+		return 0, errTruncatedOutput
+	}
+	if len(data) <= avail {
+		buf.output = append(buf.output, data...)
+		return len(data), nil
+	}
+	buf.output = append(buf.output, data[:avail]...)
+	return avail, errTruncatedOutput
+}
+
+func formatErrorData(v any) string {
+	buf := limitedBuffer{limit: 1024}
+	err := json.NewEncoder(&buf).Encode(v)
+	switch {
+	case err == nil:
+		return string(bytes.TrimRight(buf.output, "\n"))
+	case errors.Is(err, errTruncatedOutput):
+		return fmt.Sprintf("%s... (truncated)", buf.output)
+	default:
+		return fmt.Sprintf("bad error data (err=%v)", err)
+	}
 }

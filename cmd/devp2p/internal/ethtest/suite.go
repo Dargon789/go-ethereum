@@ -17,9 +17,13 @@
 package ethtest
 
 import (
+	"context"
 	"crypto/rand"
-	"math/big"
+	"errors"
+	"fmt"
 	"reflect"
+	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
@@ -30,6 +34,8 @@ import (
 	"github.com/ethereum/go-ethereum/internal/utesting"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
+	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/trie"
 	"github.com/holiman/uint256"
 )
 
@@ -65,22 +71,28 @@ func (s *Suite) EthTests() []utesting.Test {
 	return []utesting.Test{
 		// status
 		{Name: "Status", Fn: s.TestStatus},
+		{Name: "MaliciousHandshake", Fn: s.TestMaliciousHandshake},
+		{Name: "BlockRangeUpdateExpired", Fn: s.TestBlockRangeUpdateHistoryExp},
+		{Name: "BlockRangeUpdateFuture", Fn: s.TestBlockRangeUpdateFuture},
+		{Name: "BlockRangeUpdateInvalid", Fn: s.TestBlockRangeUpdateInvalid},
 		// get block headers
 		{Name: "GetBlockHeaders", Fn: s.TestGetBlockHeaders},
+		{Name: "GetNonexistentBlockHeaders", Fn: s.TestGetNonexistentBlockHeaders},
 		{Name: "SimultaneousRequests", Fn: s.TestSimultaneousRequests},
 		{Name: "SameRequestID", Fn: s.TestSameRequestID},
 		{Name: "ZeroRequestID", Fn: s.TestZeroRequestID},
-		// get block bodies
+		// get history
 		{Name: "GetBlockBodies", Fn: s.TestGetBlockBodies},
-		// // malicious handshakes + status
-		{Name: "MaliciousHandshake", Fn: s.TestMaliciousHandshake},
-		{Name: "MaliciousStatus", Fn: s.TestMaliciousStatus},
+		{Name: "GetReceipts", Fn: s.TestGetReceipts},
+		{Name: "GetLargeReceipts", Fn: s.TestGetLargeReceipts},
 		// test transactions
 		{Name: "LargeTxRequest", Fn: s.TestLargeTxRequest, Slow: true},
 		{Name: "Transaction", Fn: s.TestTransaction},
 		{Name: "InvalidTxs", Fn: s.TestInvalidTxs},
 		{Name: "NewPooledTxs", Fn: s.TestNewPooledTxs},
 		{Name: "BlobViolations", Fn: s.TestBlobViolations},
+		{Name: "TestBlobTxWithoutSidecar", Fn: s.TestBlobTxWithoutSidecar},
+		{Name: "TestBlobTxWithMismatchedSidecar", Fn: s.TestBlobTxWithMismatchedSidecar},
 	}
 }
 
@@ -96,15 +108,11 @@ func (s *Suite) SnapTests() []utesting.Test {
 
 func (s *Suite) TestStatus(t *utesting.T) {
 	t.Log(`This test is just a sanity check. It performs an eth protocol handshake.`)
-
-	conn, err := s.dial()
+	conn, err := s.dialAndPeer(nil)
 	if err != nil {
-		t.Fatalf("dial failed: %v", err)
+		t.Fatal("peering failed:", err)
 	}
-	defer conn.Close()
-	if err := conn.peer(s.chain, nil); err != nil {
-		t.Fatalf("peering failed: %v", err)
-	}
+	conn.Close()
 }
 
 // headersMatch returns whether the received headers match the given request
@@ -114,15 +122,12 @@ func headersMatch(expected []*types.Header, headers []*types.Header) bool {
 
 func (s *Suite) TestGetBlockHeaders(t *utesting.T) {
 	t.Log(`This test requests block headers from the node.`)
-
-	conn, err := s.dial()
+	conn, err := s.dialAndPeer(nil)
 	if err != nil {
-		t.Fatalf("dial failed: %v", err)
-	}
-	defer conn.Close()
-	if err = conn.peer(s.chain, nil); err != nil {
 		t.Fatalf("peering failed: %v", err)
 	}
+	defer conn.Close()
+
 	// Send headers request.
 	req := &eth.GetBlockHeadersPacket{
 		RequestId: 33,
@@ -149,8 +154,49 @@ func (s *Suite) TestGetBlockHeaders(t *utesting.T) {
 	if err != nil {
 		t.Fatalf("failed to get headers for given request: %v", err)
 	}
-	if !headersMatch(expected, headers.BlockHeadersRequest) {
+	received, err := headers.List.Items()
+	if err != nil {
+		t.Fatalf("invalid headers received: %v", err)
+	}
+	if !headersMatch(expected, received) {
 		t.Fatalf("header mismatch: \nexpected %v \ngot %v", expected, headers)
+	}
+}
+
+func (s *Suite) TestGetNonexistentBlockHeaders(t *utesting.T) {
+	t.Log(`This test sends GetBlockHeaders requests for nonexistent blocks (using max uint64 value)
+to check if the node disconnects after receiving multiple invalid requests.`)
+	conn, err := s.dialAndPeer(nil)
+	if err != nil {
+		t.Fatalf("peering failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Create request with max uint64 value for a nonexistent block
+	badReq := &eth.GetBlockHeadersPacket{
+		GetBlockHeadersRequest: &eth.GetBlockHeadersRequest{
+			Origin:  eth.HashOrNumber{Number: ^uint64(0)},
+			Amount:  1,
+			Skip:    0,
+			Reverse: false,
+		},
+	}
+
+	// Send request 10 times. Some clients are lient on the first few invalids.
+	for i := 0; i < 10; i++ {
+		badReq.RequestId = uint64(i)
+		if err := conn.Write(ethProto, eth.GetBlockHeadersMsg, badReq); err != nil {
+			if err == errDisc {
+				t.Fatalf("peer disconnected after %d requests", i+1)
+			}
+			t.Fatalf("write failed: %v", err)
+		}
+	}
+
+	// Check if peer disconnects at the end.
+	code, _, err := conn.Read()
+	if err == errDisc || code == discMsg {
+		t.Fatal("peer improperly disconnected")
 	}
 }
 
@@ -158,14 +204,11 @@ func (s *Suite) TestSimultaneousRequests(t *utesting.T) {
 	t.Log(`This test requests blocks headers from the node, performing two requests
 concurrently, with different request IDs.`)
 
-	conn, err := s.dial()
+	conn, err := s.dialAndPeer(nil)
 	if err != nil {
-		t.Fatalf("dial failed: %v", err)
-	}
-	defer conn.Close()
-	if err := conn.peer(s.chain, nil); err != nil {
 		t.Fatalf("peering failed: %v", err)
 	}
+	defer conn.Close()
 
 	// Create two different requests.
 	req1 := &eth.GetBlockHeadersPacket{
@@ -200,31 +243,23 @@ concurrently, with different request IDs.`)
 	}
 
 	// Wait for responses.
-	headers1 := new(eth.BlockHeadersPacket)
-	if err := conn.ReadMsg(ethProto, eth.BlockHeadersMsg, &headers1); err != nil {
-		t.Fatalf("error reading block headers msg: %v", err)
-	}
-	if got, want := headers1.RequestId, req1.RequestId; got != want {
-		t.Fatalf("unexpected request id in response: got %d, want %d", got, want)
-	}
-	headers2 := new(eth.BlockHeadersPacket)
-	if err := conn.ReadMsg(ethProto, eth.BlockHeadersMsg, &headers2); err != nil {
-		t.Fatalf("error reading block headers msg: %v", err)
-	}
-	if got, want := headers2.RequestId, req2.RequestId; got != want {
-		t.Fatalf("unexpected request id in response: got %d, want %d", got, want)
+	// Note they can arrive in either order.
+	resp, err := collectHeaderResponses(conn, 2, func(msg *eth.BlockHeadersPacket) uint64 {
+		if msg.RequestId != 111 && msg.RequestId != 222 {
+			t.Fatalf("response with unknown request ID: %v", msg.RequestId)
+		}
+		return msg.RequestId
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	// Check received headers for accuracy.
-	if expected, err := s.chain.GetHeaders(req1); err != nil {
-		t.Fatalf("failed to get expected headers for request 1: %v", err)
-	} else if !headersMatch(expected, headers1.BlockHeadersRequest) {
-		t.Fatalf("header mismatch: \nexpected %v \ngot %v", expected, headers1)
+	// Check if headers match.
+	if err := s.checkHeadersAgainstChain(req1, resp[111]); err != nil {
+		t.Fatal(err)
 	}
-	if expected, err := s.chain.GetHeaders(req2); err != nil {
-		t.Fatalf("failed to get expected headers for request 2: %v", err)
-	} else if !headersMatch(expected, headers2.BlockHeadersRequest) {
-		t.Fatalf("header mismatch: \nexpected %v \ngot %v", expected, headers2)
+	if err := s.checkHeadersAgainstChain(req2, resp[222]); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -232,14 +267,11 @@ func (s *Suite) TestSameRequestID(t *utesting.T) {
 	t.Log(`This test requests block headers, performing two concurrent requests with the
 same request ID. The node should handle the request by responding to both requests.`)
 
-	conn, err := s.dial()
+	conn, err := s.dialAndPeer(nil)
 	if err != nil {
-		t.Fatalf("dial failed: %v", err)
-	}
-	defer conn.Close()
-	if err := conn.peer(s.chain, nil); err != nil {
 		t.Fatalf("peering failed: %v", err)
 	}
+	defer conn.Close()
 
 	// Create two different requests with the same ID.
 	reqID := uint64(1234)
@@ -258,7 +290,7 @@ same request ID. The node should handle the request by responding to both reques
 			Origin: eth.HashOrNumber{
 				Number: 33,
 			},
-			Amount: 2,
+			Amount: 3,
 		},
 	}
 
@@ -270,47 +302,70 @@ same request ID. The node should handle the request by responding to both reques
 		t.Fatalf("failed to write to connection: %v", err)
 	}
 
-	// Wait for the responses.
-	headers1 := new(eth.BlockHeadersPacket)
-	if err := conn.ReadMsg(ethProto, eth.BlockHeadersMsg, &headers1); err != nil {
-		t.Fatalf("error reading from connection: %v", err)
-	}
-	if got, want := headers1.RequestId, request1.RequestId; got != want {
-		t.Fatalf("unexpected request id: got %d, want %d", got, want)
-	}
-	headers2 := new(eth.BlockHeadersPacket)
-	if err := conn.ReadMsg(ethProto, eth.BlockHeadersMsg, &headers2); err != nil {
-		t.Fatalf("error reading from connection: %v", err)
-	}
-	if got, want := headers2.RequestId, request2.RequestId; got != want {
-		t.Fatalf("unexpected request id: got %d, want %d", got, want)
+	// Wait for the responses. They can arrive in either order, and we can't tell them
+	// apart by their request ID, so use the number of headers instead.
+	resp, err := collectHeaderResponses(conn, 2, func(msg *eth.BlockHeadersPacket) uint64 {
+		id := uint64(msg.List.Len())
+		if id != 2 && id != 3 {
+			t.Fatalf("invalid number of headers in response: %d", id)
+		}
+		return id
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	// Check if headers match.
-	if expected, err := s.chain.GetHeaders(request1); err != nil {
-		t.Fatalf("failed to get expected block headers: %v", err)
-	} else if !headersMatch(expected, headers1.BlockHeadersRequest) {
-		t.Fatalf("header mismatch: \nexpected %v \ngot %v", expected, headers1)
+	if err := s.checkHeadersAgainstChain(request1, resp[2]); err != nil {
+		t.Fatal(err)
 	}
-	if expected, err := s.chain.GetHeaders(request2); err != nil {
-		t.Fatalf("failed to get expected block headers: %v", err)
-	} else if !headersMatch(expected, headers2.BlockHeadersRequest) {
-		t.Fatalf("header mismatch: \nexpected %v \ngot %v", expected, headers2)
+	if err := s.checkHeadersAgainstChain(request2, resp[3]); err != nil {
+		t.Fatal(err)
 	}
+}
+
+func (s *Suite) checkHeadersAgainstChain(req *eth.GetBlockHeadersPacket, resp *eth.BlockHeadersPacket) error {
+	received2, err := resp.List.Items()
+	if err != nil {
+		return fmt.Errorf("invalid headers in response with request ID %v (%d items): %v", resp.RequestId, resp.List.Len(), err)
+	}
+	if expected, err := s.chain.GetHeaders(req); err != nil {
+		return fmt.Errorf("test chain failed to get expected headers for request: %v", err)
+	} else if !headersMatch(expected, received2) {
+		return fmt.Errorf("header mismatch for request ID %v (%d items): \nexpected %v \ngot %v", resp.RequestId, resp.List.Len(), expected, resp)
+	}
+	return nil
+}
+
+// collectResponses waits for n messages of type T on the given connection.
+// The messsages are collected according to the 'identity' function.
+//
+// This function is written in a generic way to handle
+func collectHeaderResponses(conn *Conn, n int, identity func(*eth.BlockHeadersPacket) uint64) (map[uint64]*eth.BlockHeadersPacket, error) {
+	resp := make(map[uint64]*eth.BlockHeadersPacket, n)
+	for range n {
+		r := new(eth.BlockHeadersPacket)
+		if err := conn.ReadMsg(ethProto, eth.BlockHeadersMsg, r); err != nil {
+			return resp, fmt.Errorf("read error: %v", err)
+		}
+		id := identity(r)
+		if resp[id] != nil {
+			return resp, fmt.Errorf("duplicate response %v", r)
+		}
+		resp[id] = r
+	}
+	return resp, nil
 }
 
 func (s *Suite) TestZeroRequestID(t *utesting.T) {
 	t.Log(`This test sends a GetBlockHeaders message with a request-id of zero,
 and expects a response.`)
-
-	conn, err := s.dial()
+	conn, err := s.dialAndPeer(nil)
 	if err != nil {
-		t.Fatalf("dial failed: %v", err)
-	}
-	defer conn.Close()
-	if err := conn.peer(s.chain, nil); err != nil {
 		t.Fatalf("peering failed: %v", err)
 	}
+	defer conn.Close()
+
 	req := &eth.GetBlockHeadersPacket{
 		GetBlockHeadersRequest: &eth.GetBlockHeadersRequest{
 			Origin: eth.HashOrNumber{Number: 0},
@@ -328,24 +383,19 @@ and expects a response.`)
 	if got, want := headers.RequestId, req.RequestId; got != want {
 		t.Fatalf("unexpected request id")
 	}
-	if expected, err := s.chain.GetHeaders(req); err != nil {
-		t.Fatalf("failed to get expected block headers: %v", err)
-	} else if !headersMatch(expected, headers.BlockHeadersRequest) {
-		t.Fatalf("header mismatch: \nexpected %v \ngot %v", expected, headers)
+	if err := s.checkHeadersAgainstChain(req, headers); err != nil {
+		t.Fatal(err)
 	}
 }
 
 func (s *Suite) TestGetBlockBodies(t *utesting.T) {
 	t.Log(`This test sends GetBlockBodies requests to the node for known blocks in the test chain.`)
-
-	conn, err := s.dial()
+	conn, err := s.dialAndPeer(nil)
 	if err != nil {
-		t.Fatalf("dial failed: %v", err)
-	}
-	defer conn.Close()
-	if err := conn.peer(s.chain, nil); err != nil {
 		t.Fatalf("peering failed: %v", err)
 	}
+	defer conn.Close()
+
 	// Create block bodies request.
 	req := &eth.GetBlockBodiesPacket{
 		RequestId: 55,
@@ -365,9 +415,148 @@ func (s *Suite) TestGetBlockBodies(t *utesting.T) {
 	if got, want := resp.RequestId, req.RequestId; got != want {
 		t.Fatalf("unexpected request id in respond", got, want)
 	}
-	bodies := resp.BlockBodiesResponse
-	if len(bodies) != len(req.GetBlockBodiesRequest) {
-		t.Fatalf("wrong bodies in response: expected %d bodies, got %d", len(req.GetBlockBodiesRequest), len(bodies))
+	if resp.List.Len() != len(req.GetBlockBodiesRequest) {
+		t.Fatalf("wrong bodies in response: expected %d bodies, got %d", len(req.GetBlockBodiesRequest), resp.List.Len())
+	}
+}
+
+func (s *Suite) TestGetReceipts(t *utesting.T) {
+	t.Log(`This test sends GetReceipts requests to the node for known blocks in the test chain.`)
+	conn, err := s.dialAndPeer(nil)
+	if err != nil {
+		t.Fatalf("peering failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Find some blocks containing receipts.
+	var hashes = make([]common.Hash, 0, 3)
+	for i := range s.chain.Len() {
+		if s.chain.txInfo.LargeReceiptBlock != nil && uint64(i) == *s.chain.txInfo.LargeReceiptBlock {
+			continue
+		}
+		block := s.chain.GetBlock(i)
+		if len(block.Transactions()) > 0 {
+			hashes = append(hashes, block.Hash())
+		}
+		if len(hashes) == cap(hashes) {
+			break
+		}
+	}
+	if conn.negotiatedProtoVersion < eth.ETH70 {
+		// Create block bodies request.
+		req := &eth.GetReceiptsPacket69{
+			RequestId:          66,
+			GetReceiptsRequest: (eth.GetReceiptsRequest)(hashes),
+		}
+		if err := conn.Write(ethProto, eth.GetReceiptsMsg, req); err != nil {
+			t.Fatalf("could not write to connection: %v", err)
+		}
+		// Wait for response.
+		resp := new(eth.ReceiptsPacket69)
+		if err := conn.ReadMsg(ethProto, eth.ReceiptsMsg, &resp); err != nil {
+			t.Fatalf("error reading block receipts msg: %v", err)
+		}
+		if got, want := resp.RequestId, req.RequestId; got != want {
+			t.Fatalf("unexpected request id in respond", got, want)
+		}
+		if resp.List.Len() != len(req.GetReceiptsRequest) {
+			t.Fatalf("wrong receipts in response: expected %d receipts, got %d", len(req.GetReceiptsRequest), resp.List.Len())
+		}
+	} else {
+		// Create block bodies request.
+		req := &eth.GetReceiptsPacket70{
+			RequestId:              66,
+			FirstBlockReceiptIndex: 0,
+			GetReceiptsRequest:     (eth.GetReceiptsRequest)(hashes),
+		}
+		if err := conn.Write(ethProto, eth.GetReceiptsMsg, req); err != nil {
+			t.Fatalf("could not write to connection: %v", err)
+		}
+		// Wait for response.
+		resp := new(eth.ReceiptsPacket70)
+		if err := conn.ReadMsg(ethProto, eth.ReceiptsMsg, &resp); err != nil {
+			t.Fatalf("error reading block receipts msg: %v", err)
+		}
+		if got, want := resp.RequestId, req.RequestId; got != want {
+			t.Fatalf("unexpected request id in respond", got, want)
+		}
+		if resp.List.Len() != len(req.GetReceiptsRequest) {
+			t.Fatalf("wrong receipts in response: expected %d receipts, got %d", len(req.GetReceiptsRequest), resp.List.Len())
+		}
+	}
+}
+
+func (s *Suite) TestGetLargeReceipts(t *utesting.T) {
+	t.Log(`This test sends GetReceipts requests to the node for large receipt (>10MiB) in the test chain.
+	This test is meaningful only if the client supports protocol version ETH70 or higher 
+	and LargeReceiptBlock is configured in txInfo.json.`)
+	conn, err := s.dialAndPeer(nil)
+	if err != nil {
+		t.Fatalf("peering failed: %v", err)
+	}
+	defer conn.Close()
+
+	if conn.negotiatedProtoVersion < eth.ETH70 || s.chain.txInfo.LargeReceiptBlock == nil {
+		return
+	}
+
+	// Find block with large receipt.
+	// Place the large receipt block hash in the middle of the query
+	start := max(int(*s.chain.txInfo.LargeReceiptBlock)-2, 0)
+	end := min(*s.chain.txInfo.LargeReceiptBlock+2, uint64(len(s.chain.blocks)))
+
+	var blocks []common.Hash
+	var receiptHashes []common.Hash
+	var receipts []*eth.ReceiptList
+
+	for i := uint64(start); i < end; i++ {
+		block := s.chain.GetBlock(int(i))
+		blocks = append(blocks, block.Hash())
+		receiptHashes = append(receiptHashes, block.Header().ReceiptHash)
+		receipts = append(receipts, &eth.ReceiptList{})
+	}
+
+	incomplete := false
+	lastBlock := 0
+
+	for incomplete || lastBlock != len(blocks)-1 {
+		// Create get receipt request.
+		req := &eth.GetReceiptsPacket70{
+			RequestId:              66,
+			FirstBlockReceiptIndex: uint64(receipts[lastBlock].Derivable().Len()),
+			GetReceiptsRequest:     blocks[lastBlock:],
+		}
+		if err := conn.Write(ethProto, eth.GetReceiptsMsg, req); err != nil {
+			t.Fatalf("could not write to connection: %v", err)
+		}
+		// Wait for response.
+		resp := new(eth.ReceiptsPacket70)
+		if err := conn.ReadMsg(ethProto, eth.ReceiptsMsg, &resp); err != nil {
+			t.Fatalf("error reading block receipts msg: %v", err)
+		}
+		if got, want := resp.RequestId, req.RequestId; got != want {
+			t.Fatalf("unexpected request id in respond, want: %d, got: %d", got, want)
+		}
+
+		receiptLists, _ := resp.List.Items()
+		for i, rc := range receiptLists {
+			receipts[lastBlock+i].Append(rc)
+		}
+		lastBlock += len(receiptLists) - 1
+
+		incomplete = resp.LastBlockIncomplete
+	}
+
+	hasher := trie.NewStackTrie(nil)
+	hashes := make([]common.Hash, len(receipts))
+	for i := range receipts {
+		hashes[i] = types.DeriveSha(receipts[i].Derivable(), hasher)
+	}
+
+	for i, hash := range hashes {
+		if receiptHashes[i] != hash {
+			t.Fatalf("wrong receipt root: want %x, got %x", receiptHashes[i], hash)
+		}
 	}
 }
 
@@ -453,39 +642,94 @@ func (s *Suite) TestMaliciousHandshake(t *utesting.T) {
 	}
 }
 
-func (s *Suite) TestMaliciousStatus(t *utesting.T) {
-	t.Log(`This test sends a malicious eth Status message to the node and expects a disconnect.`)
-
-	conn, err := s.dial()
+func (s *Suite) TestBlockRangeUpdateInvalid(t *utesting.T) {
+	t.Log(`This test sends an invalid BlockRangeUpdate message to the node and expects to be disconnected.`)
+	conn, err := s.dialAndPeer(nil)
 	if err != nil {
-		t.Fatalf("dial failed: %v", err)
+		t.Fatal(err)
 	}
 	defer conn.Close()
-	if err := conn.handshake(); err != nil {
-		t.Fatalf("handshake failed: %v", err)
+
+	conn.Write(ethProto, eth.BlockRangeUpdateMsg, &eth.BlockRangeUpdatePacket{
+		EarliestBlock:   10,
+		LatestBlock:     8,
+		LatestBlockHash: s.chain.GetBlock(8).Hash(),
+	})
+
+	if code, _, err := conn.Read(); err != nil {
+		t.Fatalf("expected disconnect, got err: %v", err)
+	} else if code != discMsg {
+		t.Fatalf("expected disconnect message, got msg code %d", code)
 	}
-	// Create status with large total difficulty.
-	status := &eth.StatusPacket{
-		ProtocolVersion: uint32(conn.negotiatedProtoVersion),
-		NetworkID:       s.chain.config.ChainID.Uint64(),
-		TD:              new(big.Int).SetBytes(randBuf(2048)),
-		Head:            s.chain.Head().Hash(),
-		Genesis:         s.chain.GetBlock(0).Hash(),
-		ForkID:          s.chain.ForkID(),
-	}
-	if err := conn.statusExchange(s.chain, status); err != nil {
-		t.Fatalf("status exchange failed: %v", err)
-	}
-	// Wait for disconnect.
-	code, _, err := conn.Read()
+}
+
+func (s *Suite) TestBlockRangeUpdateFuture(t *utesting.T) {
+	t.Log(`This test sends a BlockRangeUpdate that is beyond the chain head.
+The node should accept the update and should not disonnect.`)
+	conn, err := s.dialAndPeer(nil)
 	if err != nil {
-		t.Fatalf("error reading from connection: %v", err)
+		t.Fatal(err)
 	}
-	switch code {
-	case discMsg:
-		break
-	default:
-		t.Fatalf("expected disconnect, got: %d", code)
+	defer conn.Close()
+
+	head := s.chain.Head().NumberU64()
+	var hash common.Hash
+	rand.Read(hash[:])
+	conn.Write(ethProto, eth.BlockRangeUpdateMsg, &eth.BlockRangeUpdatePacket{
+		EarliestBlock:   head + 10,
+		LatestBlock:     head + 50,
+		LatestBlockHash: hash,
+	})
+
+	// Ensure the node does not disconnect us.
+	// Just send a few ping messages.
+	for range 10 {
+		time.Sleep(100 * time.Millisecond)
+		if err := conn.Write(baseProto, pingMsg, []any{}); err != nil {
+			t.Fatal("write error:", err)
+		}
+		code, _, err := conn.Read()
+		switch {
+		case err != nil:
+			t.Fatal("read error:", err)
+		case code == discMsg:
+			t.Fatal("got disconnect")
+		case code == pongMsg:
+		}
+	}
+}
+
+func (s *Suite) TestBlockRangeUpdateHistoryExp(t *utesting.T) {
+	t.Log(`This test sends a BlockRangeUpdate announcing incomplete (expired) history.
+The node should accept the update and should not disonnect.`)
+	conn, err := s.dialAndPeer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	head := s.chain.Head()
+	conn.Write(ethProto, eth.BlockRangeUpdateMsg, &eth.BlockRangeUpdatePacket{
+		EarliestBlock:   head.NumberU64() - 10,
+		LatestBlock:     head.NumberU64(),
+		LatestBlockHash: head.Hash(),
+	})
+
+	// Ensure the node does not disconnect us.
+	// Just send a few ping messages.
+	for range 10 {
+		time.Sleep(100 * time.Millisecond)
+		if err := conn.Write(baseProto, pingMsg, []any{}); err != nil {
+			t.Fatal("write error:", err)
+		}
+		code, _, err := conn.Read()
+		switch {
+		case err != nil:
+			t.Fatal("read error:", err)
+		case code == discMsg:
+			t.Fatal("got disconnect")
+		case code == pongMsg:
+		}
 	}
 }
 
@@ -666,7 +910,11 @@ on another peer connection using GetPooledTransactions.`)
 	if got, want := msg.RequestId, req.RequestId; got != want {
 		t.Fatalf("unexpected request id in response: got %d, want %d", got, want)
 	}
-	for _, got := range msg.PooledTransactionsResponse {
+	responseTxs, err := msg.List.Items()
+	if err != nil {
+		t.Fatalf("invalid transactions in response: %v", err)
+	}
+	for _, got := range responseTxs {
 		if _, exists := set[got.Hash()]; !exists {
 			t.Fatalf("unexpected tx received: %v", got.Hash())
 		}
@@ -754,23 +1002,19 @@ func makeSidecar(data ...byte) *types.BlobTxSidecar {
 	)
 	for i := range blobs {
 		blobs[i][0] = data[i]
-		c, _ := kzg4844.BlobToCommitment(blobs[i])
-		p, _ := kzg4844.ComputeBlobProof(blobs[i], c)
+		c, _ := kzg4844.BlobToCommitment(&blobs[i])
+		p, _ := kzg4844.ComputeBlobProof(&blobs[i], c)
 		commitments = append(commitments, c)
 		proofs = append(proofs, p)
 	}
-	return &types.BlobTxSidecar{
-		Blobs:       blobs,
-		Commitments: commitments,
-		Proofs:      proofs,
-	}
+	return types.NewBlobTxSidecar(types.BlobSidecarVersion0, blobs, commitments, proofs)
 }
 
 func (s *Suite) makeBlobTxs(count, blobs int, discriminator byte) (txs types.Transactions) {
 	from, nonce := s.chain.GetSender(5)
 	for i := 0; i < count; i++ {
 		// Make blob data, max of 2 blobs per tx.
-		blobdata := make([]byte, blobs%3)
+		blobdata := make([]byte, min(blobs, 2))
 		for i := range blobdata {
 			blobdata[i] = discriminator
 			blobs -= 1
@@ -781,7 +1025,7 @@ func (s *Suite) makeBlobTxs(count, blobs int, discriminator byte) (txs types.Tra
 			GasTipCap:  uint256.NewInt(1),
 			GasFeeCap:  uint256.MustFromBig(s.chain.Head().BaseFee()),
 			Gas:        100000,
-			BlobFeeCap: uint256.MustFromBig(eip4844.CalcBlobFee(*s.chain.Head().ExcessBlobGas())),
+			BlobFeeCap: uint256.MustFromBig(eip4844.CalcBlobFee(s.chain.config, s.chain.Head().Header())),
 			BlobHashes: makeSidecar(blobdata...).BlobHashes(),
 			Sidecar:    makeSidecar(blobdata...),
 		}
@@ -842,15 +1086,218 @@ func (s *Suite) TestBlobViolations(t *utesting.T) {
 		if err := conn.ReadMsg(ethProto, eth.GetPooledTransactionsMsg, req); err != nil {
 			t.Fatalf("reading pooled tx request failed: %v", err)
 		}
-		resp := eth.PooledTransactionsPacket{RequestId: req.RequestId, PooledTransactionsResponse: test.resp}
+
+		encTxs, _ := rlp.EncodeToRawList(test.resp)
+		resp := eth.PooledTransactionsPacket{RequestId: req.RequestId, List: encTxs}
 		if err := conn.Write(ethProto, eth.PooledTransactionsMsg, resp); err != nil {
 			t.Fatalf("writing pooled tx response failed: %v", err)
 		}
 		if code, _, err := conn.Read(); err != nil {
 			t.Fatalf("expected disconnect on blob violation, got err: %v", err)
 		} else if code != discMsg {
-			t.Fatalf("expected disconnect on blob violation, got msg code: %d", code)
+			if code == protoOffset(ethProto)+eth.NewPooledTransactionHashesMsg {
+				// sometimes we'll get a blob transaction hashes announcement before the disconnect
+				// because blob transactions are scheduled to be fetched right away.
+				if code, _, err = conn.Read(); err != nil {
+					t.Fatalf("expected disconnect on blob violation, got err on second read: %v", err)
+				}
+			}
+			if code != discMsg {
+				t.Fatalf("expected disconnect on blob violation, got msg code: %d", code)
+			}
 		}
 		conn.Close()
+	}
+}
+
+// mangleSidecar returns a copy of the given blob transaction where the sidecar
+// data has been modified to produce a different commitment hash.
+func mangleSidecar(tx *types.Transaction) *types.Transaction {
+	sidecar := tx.BlobTxSidecar()
+	cpy := sidecar.Copy()
+	// zero the first commitment to alter the sidecar hash
+	cpy.Commitments[0] = kzg4844.Commitment{}
+	return tx.WithBlobTxSidecar(cpy)
+}
+
+func (s *Suite) TestBlobTxWithoutSidecar(t *utesting.T) {
+	t.Log(`This test checks that a blob transaction first advertised/transmitted without blobs will result in the sending peer being disconnected, and the full transaction should be successfully retrieved from another peer.`)
+	tx := s.makeBlobTxs(1, 2, 42)[0]
+	badTx := tx.WithoutBlobTxSidecar()
+	s.testBadBlobTx(t, tx, badTx)
+}
+
+func (s *Suite) TestBlobTxWithMismatchedSidecar(t *utesting.T) {
+	t.Log(`This test checks that a blob transaction first advertised/transmitted without blobs, whose commitment don't correspond to the blob_versioned_hashes in the transaction, will result in the sending peer being disconnected, and the full transaction should be successfully retrieved from another peer.`)
+	tx := s.makeBlobTxs(1, 2, 43)[0]
+	badTx := mangleSidecar(tx)
+	s.testBadBlobTx(t, tx, badTx)
+}
+
+// readUntil reads eth protocol messages until a message of the target type is
+// received.  It returns an error if there is a disconnect, or if the context
+// is cancelled before a message of the desired type can be read.
+func readUntil[T any](ctx context.Context, conn *Conn) (*T, error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, context.Canceled
+		default:
+		}
+		received, err := conn.ReadEth()
+		if err != nil {
+			if err == errDisc {
+				return nil, errDisc
+			}
+			continue
+		}
+
+		switch res := received.(type) {
+		case *T:
+			return res, nil
+		}
+	}
+}
+
+// readUntilDisconnect reads eth protocol messages until the peer disconnects.
+// It returns whether the peer disconnects in the next 100ms.
+func readUntilDisconnect(conn *Conn) (disconnected bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err := readUntil[struct{}](ctx, conn)
+	return err == errDisc
+}
+
+func (s *Suite) testBadBlobTx(t *utesting.T, tx *types.Transaction, badTx *types.Transaction) {
+	stage1, stage2, stage3 := new(sync.WaitGroup), new(sync.WaitGroup), new(sync.WaitGroup)
+	stage1.Add(1)
+	stage2.Add(1)
+	stage3.Add(1)
+
+	errc := make(chan error)
+
+	badPeer := func() {
+		// announce the correct hash from the bad peer.
+		// when the transaction is first requested before transmitting it from the bad peer,
+		// trigger step 2: connection and announcement by good peers
+
+		conn, err := s.dial()
+		if err != nil {
+			errc <- fmt.Errorf("dial fail: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		if err := conn.peer(s.chain, nil); err != nil {
+			errc <- fmt.Errorf("bad peer: peering failed: %v", err)
+			return
+		}
+
+		ann := eth.NewPooledTransactionHashesPacket{
+			Types:  []byte{types.BlobTxType},
+			Sizes:  []uint32{uint32(badTx.Size())},
+			Hashes: []common.Hash{badTx.Hash()},
+		}
+
+		if err := conn.Write(ethProto, eth.NewPooledTransactionHashesMsg, ann); err != nil {
+			errc <- fmt.Errorf("sending announcement failed: %v", err)
+			return
+		}
+
+		req, err := readUntil[eth.GetPooledTransactionsPacket](context.Background(), conn)
+		if err != nil {
+			errc <- fmt.Errorf("failed to read GetPooledTransactions message: %v", err)
+			return
+		}
+
+		stage1.Done()
+		stage2.Wait()
+
+		// the good peer is connected, and has announced the tx.
+		// proceed to send the incorrect one from the bad peer.
+
+		encTxs, _ := rlp.EncodeToRawList([]*types.Transaction{badTx})
+		resp := eth.PooledTransactionsPacket{RequestId: req.RequestId, List: encTxs}
+		if err := conn.Write(ethProto, eth.PooledTransactionsMsg, resp); err != nil {
+			errc <- fmt.Errorf("writing pooled tx response failed: %v", err)
+			return
+		}
+		if !readUntilDisconnect(conn) {
+			errc <- errors.New("expected bad peer to be disconnected")
+			return
+		}
+		stage3.Done()
+	}
+
+	goodPeer := func() {
+		stage1.Wait()
+
+		conn, err := s.dial()
+		if err != nil {
+			errc <- fmt.Errorf("dial fail: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		if err := conn.peer(s.chain, nil); err != nil {
+			errc <- fmt.Errorf("peering failed: %v", err)
+			return
+		}
+
+		ann := eth.NewPooledTransactionHashesPacket{
+			Types:  []byte{types.BlobTxType},
+			Sizes:  []uint32{uint32(tx.Size())},
+			Hashes: []common.Hash{tx.Hash()},
+		}
+
+		if err := conn.Write(ethProto, eth.NewPooledTransactionHashesMsg, ann); err != nil {
+			errc <- fmt.Errorf("sending announcement failed: %v", err)
+			return
+		}
+
+		// wait until the bad peer has transmitted the incorrect transaction
+		stage2.Done()
+		stage3.Wait()
+
+		// the bad peer has transmitted the bad tx, and been disconnected.
+		// transmit the same tx but with correct sidecar from the good peer.
+
+		var req *eth.GetPooledTransactionsPacket
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		defer cancel()
+
+		req, err = readUntil[eth.GetPooledTransactionsPacket](ctx, conn)
+		if err != nil {
+			errc <- fmt.Errorf("reading pooled tx request failed: %v", err)
+			return
+		}
+
+		if req.GetPooledTransactionsRequest[0] != tx.Hash() {
+			errc <- errors.New("requested unknown tx hash")
+			return
+		}
+
+		encTxs, _ := rlp.EncodeToRawList([]*types.Transaction{tx})
+		resp := eth.PooledTransactionsPacket{RequestId: req.RequestId, List: encTxs}
+		if err := conn.Write(ethProto, eth.PooledTransactionsMsg, resp); err != nil {
+			errc <- fmt.Errorf("writing pooled tx response failed: %v", err)
+			return
+		}
+		if readUntilDisconnect(conn) {
+			errc <- errors.New("unexpected disconnect")
+			return
+		}
+		close(errc)
+	}
+
+	if err := s.engine.sendForkchoiceUpdated(); err != nil {
+		t.Fatalf("send fcu failed: %v", err)
+	}
+
+	go goodPeer()
+	go badPeer()
+	err := <-errc
+	if err != nil {
+		t.Fatalf("%v", err)
 	}
 }
