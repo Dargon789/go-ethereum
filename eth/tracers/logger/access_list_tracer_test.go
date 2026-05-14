@@ -1,4 +1,4 @@
-// Copyright 2021 The go-ethereum Authors
+// Copyright 2026 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
 // The go-ethereum library is free software: you can redistribute it and/or modify
@@ -14,13 +14,26 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
-package snap
+package logger
 
 import (
-	"time"
+	"testing"
 
-	"github.com/ethereum/go-ethereum/p2p/tracker"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 )
 
-// requestTracker is a singleton tracker for request times.
-var requestTracker = tracker.New(ProtocolName, time.Minute)
+func TestNewAccessListTracerExcludedAddress(t *testing.T) {
+	excluded := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	slot := common.HexToHash("0x01")
+	prelude := types.AccessList{{
+		Address:     excluded,
+		StorageKeys: []common.Hash{slot},
+	}}
+	excl := map[common.Address]struct{}{excluded: {}}
+	tracer := NewAccessListTracer(prelude, excl)
+	got := tracer.AccessList()
+	if len(got) != 0 {
+		t.Fatalf("excluded prelude address must not contribute tuples, got %+v", got)
+	}
+}
