@@ -241,7 +241,7 @@ func encodeForPool(tx *types.Transaction) []byte {
 	return blob
 }
 
-// makeMultiBlobTx is a utility method to construct a ramdom blob tx with
+// makeMultiBlobTx is a utility method to construct a random blob tx with
 // certain number of blobs in its sidecar.
 func makeMultiBlobTx(nonce uint64, gasTipCap uint64, gasFeeCap uint64, blobFeeCap uint64, blobCount int, blobOffset int, key *ecdsa.PrivateKey, version byte) *types.Transaction {
 	var (
@@ -440,11 +440,11 @@ func verifyBlobRetrievals(t *testing.T, pool *BlobPool) {
 			hashes = append(hashes, tx.vhashes...)
 		}
 	}
-	blobs1, _, proofs1, err := pool.GetBlobs(hashes, types.BlobSidecarVersion0)
+	blobs1, _, proofs1, err := pool.getBlobs(hashes, types.BlobSidecarVersion0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	blobs2, _, proofs2, err := pool.GetBlobs(hashes, types.BlobSidecarVersion1)
+	blobs2, _, proofs2, err := pool.getBlobs(hashes, types.BlobSidecarVersion1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -558,7 +558,7 @@ func TestOpenDrops(t *testing.T) {
 		id, _ := store.Put(blob)
 		dangling[id] = struct{}{}
 	}
-	// Insert a sequence of transactions with already passed nonces to veirfy
+	// Insert a sequence of transactions with already passed nonces to verify
 	// that the entire set will get dropped (case 4).
 	var (
 		filler, _ = crypto.GenerateKey()
@@ -2087,7 +2087,7 @@ func TestGetBlobs(t *testing.T) {
 			filled[len(vhashes)] = struct{}{}
 			vhashes = append(vhashes, testrand.Hash())
 		}
-		blobs, _, proofs, err := pool.GetBlobs(vhashes, c.version)
+		blobs, _, proofs, err := pool.getBlobs(vhashes, c.version)
 		if err != nil {
 			t.Errorf("Unexpected error for case %d, %v", i, err)
 		}
