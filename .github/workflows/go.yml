@@ -7,8 +7,10 @@ on:
       - master
   workflow_dispatch:
 
-permissions:
-  contents: read
+# Free runner capacity by cancelling superseded PR runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
