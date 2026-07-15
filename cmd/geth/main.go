@@ -49,21 +49,19 @@ var (
 	// flags that configure the node
 	nodeFlags = slices.Concat([]cli.Flag{
 		utils.IdentityFlag,
-		utils.UnlockedAccountFlag,
 		utils.PasswordFileFlag,
 		utils.BootnodesFlag,
 		utils.MinFreeDiskSpaceFlag,
 		utils.KeyStoreDirFlag,
 		utils.ExternalSignerFlag,
-		utils.NoUSBFlag, // deprecated
 		utils.USBFlag,
 		utils.SmartCardDaemonPathFlag,
 		utils.OverrideOsaka,
+		utils.OverrideAmsterdam,
 		utils.OverrideBPO1,
 		utils.OverrideBPO2,
 		utils.OverrideUBT,
 		utils.OverrideGenesisFlag,
-		utils.EnablePersonal, // deprecated
 		utils.TxPoolLocalsFlag,
 		utils.TxPoolNoLocalsFlag,
 		utils.TxPoolJournalFlag,
@@ -78,12 +76,12 @@ var (
 		utils.BlobPoolDataDirFlag,
 		utils.BlobPoolDataCapFlag,
 		utils.BlobPoolPriceBumpFlag,
+		utils.BlobPoolFetchProbabilityFlag,
 		utils.SyncModeFlag,
 		utils.SyncTargetFlag,
 		utils.ExitWhenSyncedFlag,
 		utils.GCModeFlag,
 		utils.SnapshotFlag,
-		utils.TxLookupLimitFlag, // deprecated
 		utils.TransactionHistoryFlag,
 		utils.ChainHistoryFlag,
 		utils.LogHistoryFlag,
@@ -95,37 +93,31 @@ var (
 		utils.BinTrieGroupDepthFlag,
 		utils.LightKDFFlag,
 		utils.EthRequiredBlocksFlag,
-		utils.LegacyWhitelistFlag, // deprecated
 		utils.CacheFlag,
 		utils.CacheDatabaseFlag,
 		utils.CacheTrieFlag,
-		utils.CacheTrieJournalFlag,   // deprecated
-		utils.CacheTrieRejournalFlag, // deprecated
 		utils.CacheGCFlag,
 		utils.CacheSnapshotFlag,
 		utils.CacheNoPrefetchFlag,
 		utils.CachePreimagesFlag,
 		utils.CacheLogSizeFlag,
 		utils.FDLimitFlag,
+		utils.MemoryLimitFlag,
 		utils.CryptoKZGFlag,
 		utils.ListenPortFlag,
 		utils.DiscoveryPortFlag,
 		utils.MaxPeersFlag,
 		utils.MaxPendingPeersFlag,
-		utils.MiningEnabledFlag, // deprecated
 		utils.MinerGasLimitFlag,
 		utils.MinerGasPriceFlag,
-		utils.MinerEtherbaseFlag, // deprecated
 		utils.MinerExtraDataFlag,
 		utils.MinerMaxBlobsFlag,
 		utils.MinerRecommitIntervalFlag,
 		utils.MinerPendingFeeRecipientFlag,
-		utils.MinerNewPayloadTimeoutFlag, // deprecated
 		utils.NATFlag,
 		utils.NoDiscoverFlag,
 		utils.DiscoveryV4Flag,
 		utils.DiscoveryV5Flag,
-		utils.LegacyDiscoveryV5Flag, // deprecated
 		utils.NetrestrictFlag,
 		utils.NodeKeyFileFlag,
 		utils.NodeKeyHexFlag,
@@ -145,8 +137,6 @@ var (
 		utils.GpoMaxGasPriceFlag,
 		utils.GpoIgnoreGasPriceFlag,
 		configFileFlag,
-		utils.LogDebugFlag,
-		utils.LogBacktraceAtFlag,
 		utils.BeaconApiFlag,
 		utils.BeaconApiHeaderFlag,
 		utils.BeaconThresholdFlag,
@@ -182,14 +172,15 @@ var (
 		utils.WSPathPrefixFlag,
 		utils.IPCDisabledFlag,
 		utils.IPCPathFlag,
-		utils.InsecureUnlockAllowedFlag,
 		utils.RPCGlobalGasCapFlag,
 		utils.RPCGlobalEVMTimeoutFlag,
 		utils.RPCGlobalTxFeeCapFlag,
 		utils.RPCGlobalLogQueryLimit,
+		utils.EngineMaxReorgDepthFlag,
 		utils.AllowUnprotectedTxs,
 		utils.BatchRequestLimit,
 		utils.BatchResponseMaxSize,
+		utils.HTTPBodyLimitFlag,
 		utils.RPCTxSyncDefaultTimeoutFlag,
 		utils.RPCTxSyncMaxTimeoutFlag,
 		utils.RPCGlobalRangeLimitFlag,
@@ -204,7 +195,6 @@ var (
 
 	metricsFlags = []cli.Flag{
 		utils.MetricsEnabledFlag,
-		utils.MetricsEnabledExpensiveFlag,
 		utils.MetricsHTTPFlag,
 		utils.MetricsPortFlag,
 		utils.MetricsEnableInfluxDBFlag,
@@ -219,6 +209,7 @@ var (
 		utils.MetricsInfluxDBBucketFlag,
 		utils.MetricsInfluxDBOrganizationFlag,
 		utils.StateSizeTrackingFlag,
+		utils.SnapV2Flag,
 	}
 )
 
@@ -303,13 +294,13 @@ func main() {
 func prepare(ctx *cli.Context) {
 	// If we're running a known preset, log it for convenience.
 	switch {
-	case ctx.IsSet(utils.SepoliaFlag.Name):
+	case ctx.Bool(utils.SepoliaFlag.Name):
 		log.Info("Starting Geth on Sepolia testnet...")
 
-	case ctx.IsSet(utils.HoleskyFlag.Name):
+	case ctx.Bool(utils.HoleskyFlag.Name):
 		log.Info("Starting Geth on Holesky testnet...")
 
-	case ctx.IsSet(utils.HoodiFlag.Name):
+	case ctx.Bool(utils.HoodiFlag.Name):
 		log.Info("Starting Geth on Hoodi testnet...")
 
 	case !ctx.IsSet(utils.NetworkIdFlag.Name):
@@ -339,10 +330,6 @@ func geth(ctx *cli.Context) error {
 func startNode(ctx *cli.Context, stack *node.Node, isConsole bool) {
 	// Start up the node itself
 	utils.StartNode(ctx, stack, isConsole)
-
-	if ctx.IsSet(utils.UnlockedAccountFlag.Name) {
-		log.Warn(`The "unlock" flag has been deprecated and has no effect`)
-	}
 
 	// Register wallet event handlers to open and auto-derive wallets
 	events := make(chan accounts.WalletEvent, 16)

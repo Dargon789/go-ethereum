@@ -62,6 +62,7 @@ var (
 		Flags: slices.Concat([]cli.Flag{
 			utils.CachePreimagesFlag,
 			utils.OverrideOsaka,
+			utils.OverrideAmsterdam,
 			utils.OverrideBPO1,
 			utils.OverrideBPO2,
 			utils.OverrideUBT,
@@ -101,7 +102,6 @@ if one is set.  Otherwise it prints the genesis from the datadir.`,
 			utils.NoCompactionFlag,
 			utils.LogSlowBlockFlag,
 			utils.MetricsEnabledFlag,
-			utils.MetricsEnabledExpensiveFlag,
 			utils.MetricsHTTPFlag,
 			utils.MetricsPortFlag,
 			utils.MetricsEnableInfluxDBFlag,
@@ -116,7 +116,6 @@ if one is set.  Otherwise it prints the genesis from the datadir.`,
 			utils.MetricsInfluxDBBucketFlag,
 			utils.MetricsInfluxDBOrganizationFlag,
 			utils.StateSizeTrackingFlag,
-			utils.TxLookupLimitFlag,
 			utils.VMTraceFlag,
 			utils.VMTraceJsonConfigFlag,
 			utils.TransactionHistoryFlag,
@@ -157,7 +156,7 @@ be gzipped.`,
 		Name:      "import-history",
 		Usage:     "Import an Era archive",
 		ArgsUsage: "<dir>",
-		Flags:     slices.Concat([]cli.Flag{utils.TxLookupLimitFlag, utils.TransactionHistoryFlag, utils.EraFormatFlag}, utils.DatabaseFlags, utils.NetworkFlags),
+		Flags:     slices.Concat([]cli.Flag{utils.TransactionHistoryFlag, utils.EraFormatFlag}, utils.DatabaseFlags, utils.NetworkFlags),
 		Description: `
 The import-history command will import blocks and their corresponding receipts
 from Era archives.
@@ -288,6 +287,10 @@ func initGenesis(ctx *cli.Context) error {
 	if ctx.IsSet(utils.OverrideOsaka.Name) {
 		v := ctx.Uint64(utils.OverrideOsaka.Name)
 		overrides.OverrideOsaka = &v
+	}
+	if ctx.IsSet(utils.OverrideAmsterdam.Name) {
+		v := ctx.Uint64(utils.OverrideAmsterdam.Name)
+		overrides.OverrideAmsterdam = &v
 	}
 	if ctx.IsSet(utils.OverrideBPO1.Name) {
 		v := ctx.Uint64(utils.OverrideBPO1.Name)
@@ -528,15 +531,15 @@ func importHistory(ctx *cli.Context) error {
 
 	var (
 		format = ctx.String(utils.EraFormatFlag.Name)
-		from   func(era.ReadAtSeekCloser) (era.Era, error)
+		from   func(f era.ReadAtSeekCloser) (era.Era, error)
 	)
 	switch format {
 	case "era1", "era":
 		from = onedb.From
-	case "erae":
+	case "ere":
 		from = execdb.From
 	default:
-		return fmt.Errorf("unknown --era.format %q (expected 'era1' or 'erae')", format)
+		return fmt.Errorf("unknown --era.format %q (expected 'era1' or 'ere')", format)
 	}
 	if err := utils.ImportHistory(chain, dir, network, from); err != nil {
 		return err
@@ -582,11 +585,11 @@ func exportHistory(ctx *cli.Context) error {
 	case "era1", "era":
 		newBuilder = func(w io.Writer) era.Builder { return onedb.NewBuilder(w) }
 		filename = func(network string, epoch int, root common.Hash) string { return onedb.Filename(network, epoch, root) }
-	case "erae":
+	case "ere":
 		newBuilder = func(w io.Writer) era.Builder { return execdb.NewBuilder(w) }
 		filename = func(network string, epoch int, root common.Hash) string { return execdb.Filename(network, epoch, root) }
 	default:
-		return fmt.Errorf("unknown archive format %q (use 'era1' or 'erae')", format)
+		return fmt.Errorf("unknown archive format %q (use 'era1' or 'ere')", format)
 	}
 	if err := utils.ExportHistory(chain, dir, uint64(first), uint64(last), newBuilder, filename); err != nil {
 		utils.Fatalf("Export error: %v\n", err)
@@ -744,7 +747,7 @@ func pruneHistory(ctx *cli.Context) error {
 	)
 
 	// Check the current freezer tail to see if pruning is needed/possible.
-	freezerTail, _ := chaindb.Tail()
+	freezerTail, _ := chaindb.Tail(rawdb.ChainFreezerBlockDataGroup)
 	if freezerTail > 0 {
 		if freezerTail == targetBlock {
 			log.Info("Database already pruned to target block", "tail", freezerTail)
@@ -776,7 +779,7 @@ func pruneHistory(ctx *cli.Context) error {
 	log.Info("Starting history pruning", "head", currentHeader.Number, "target", targetBlock, "targetHash", targetBlockHash.Hex())
 	start := time.Now()
 	rawdb.PruneTransactionIndex(chaindb, targetBlock)
-	if _, err := chaindb.TruncateTail(targetBlock); err != nil {
+	if _, err := chaindb.TruncateTail(rawdb.ChainFreezerBlockDataGroup, targetBlock); err != nil {
 		return fmt.Errorf("failed to truncate ancient data: %v", err)
 	}
 	log.Info("History pruning completed", "tail", targetBlock, "elapsed", common.PrettyDuration(time.Since(start)))
@@ -794,8 +797,8 @@ func downloadEra(ctx *cli.Context) error {
 	var network = "mainnet"
 	if utils.IsNetworkPreset(ctx) {
 		switch {
-		case ctx.IsSet(utils.MainnetFlag.Name):
-		case ctx.IsSet(utils.SepoliaFlag.Name):
+		case ctx.Bool(utils.MainnetFlag.Name):
+		case ctx.Bool(utils.SepoliaFlag.Name):
 			network = "sepolia"
 		default:
 			return errors.New("unsupported network, no known era1 checksums")
@@ -822,7 +825,7 @@ func downloadEra(ctx *cli.Context) error {
 		return err
 	}
 	switch {
-	case ctx.IsSet(eraAllFlag.Name):
+	case ctx.Bool(eraAllFlag.Name):
 		return l.DownloadAll(dir)
 
 	case ctx.IsSet(eraBlockFlag.Name):

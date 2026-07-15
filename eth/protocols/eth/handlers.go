@@ -26,6 +26,7 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/crypto/kzg4844"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p/tracker"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -568,7 +569,27 @@ func handleNewPooledTransactionHashes(backend Backend, msg Decoder, peer *Peer) 
 	if !backend.AcceptTxs() {
 		return nil
 	}
-	ann := new(NewPooledTransactionHashesPacket)
+	ann := new(NewPooledTransactionHashesPacket71)
+	if err := msg.Decode(ann); err != nil {
+		return err
+	}
+	if len(ann.Hashes) != len(ann.Types) || len(ann.Hashes) != len(ann.Sizes) {
+		return fmt.Errorf("NewPooledTransactionHashes: invalid len of fields in %v %v %v", len(ann.Hashes), len(ann.Types), len(ann.Sizes))
+	}
+	// Schedule all the unknown hashes for retrieval
+	for _, hash := range ann.Hashes {
+		peer.MarkTransaction(hash)
+	}
+	return backend.Handle(peer, ann)
+}
+
+func handleNewPooledTransactionHashes72(backend Backend, msg Decoder, peer *Peer) error {
+	// New transaction announcement arrived, make sure we have
+	// a valid and fresh chain to handle them
+	if !backend.AcceptTxs() {
+		return nil
+	}
+	ann := new(NewPooledTransactionHashesPacket72)
 	if err := msg.Decode(ann); err != nil {
 		return err
 	}
@@ -588,11 +609,11 @@ func handleGetPooledTransactions(backend Backend, msg Decoder, peer *Peer) error
 	if err := msg.Decode(&query); err != nil {
 		return err
 	}
-	hashes, txs := answerGetPooledTransactions(backend, query.GetPooledTransactionsRequest)
+	hashes, txs := answerGetPooledTransactions(backend, query.GetPooledTransactionsRequest, peer.version)
 	return peer.ReplyPooledTransactionsRLP(query.RequestId, hashes, txs)
 }
 
-func answerGetPooledTransactions(backend Backend, query GetPooledTransactionsRequest) ([]common.Hash, []rlp.RawValue) {
+func answerGetPooledTransactions(backend Backend, query GetPooledTransactionsRequest, version uint) ([]common.Hash, []rlp.RawValue) {
 	// Gather transactions until the fetch or network limits is reached
 	var (
 		bytes  int
@@ -604,7 +625,7 @@ func answerGetPooledTransactions(backend Backend, query GetPooledTransactionsReq
 			break
 		}
 		// Retrieve the requested transaction, skipping if unknown to us
-		encoded := backend.TxPool().GetRLP(hash)
+		encoded := backend.TxPool().GetRLP(hash, version)
 		if len(encoded) == 0 {
 			continue
 		}
@@ -665,4 +686,148 @@ func handleBlockRangeUpdate(backend Backend, msg Decoder, peer *Peer) error {
 	// We don't do anything with these messages for now, just store them on the peer.
 	peer.lastRange.Store(&update)
 	return nil
+}
+
+func handleGetCells(backend Backend, msg Decoder, peer *Peer) error {
+	// Decode the cell retrieval message
+	var query GetCellsRequestPacket
+	if err := msg.Decode(&query); err != nil {
+		return err
+	}
+	hashes, cells, custody := answerGetCells(backend, query.GetCellsRequest)
+	return peer.ReplyCells(query.RequestId, hashes, cells, custody)
+}
+
+func answerGetCells(backend Backend, query GetCellsRequest) ([]common.Hash, [][]kzg4844.Cell, types.CustodyBitmap) {
+	var (
+		cellCounts int
+		hashes     []common.Hash
+		cells      [][]kzg4844.Cell
+	)
+	maxCells := softResponseLimit / 2048
+	for _, hash := range query.Hashes {
+		if cellCounts >= maxCells {
+			break
+		}
+		// Look up the blob versioned hashes for this transaction
+		vhashes := backend.BlobPool().GetBlobHashes(hash)
+		if len(vhashes) == 0 {
+			continue
+		}
+		blobCells, _, _ := backend.BlobPool().GetBlobCells(vhashes, query.Mask)
+
+		// Flatten per-blob cells into a single slice. If any blob has a nil
+		// entry (unavailable cell), skip the entire transaction.
+		var flat []kzg4844.Cell
+		skip := false
+		for _, bc := range blobCells {
+			if bc == nil {
+				skip = true
+				break
+			}
+			for _, c := range bc {
+				if c == nil {
+					skip = true
+					break
+				}
+				flat = append(flat, *c)
+			}
+			if skip {
+				break
+			}
+		}
+		if skip || len(flat) == 0 {
+			continue
+		}
+		hashes = append(hashes, hash)
+		cells = append(cells, flat)
+		cellCounts += len(flat)
+	}
+	return hashes, cells, query.Mask
+}
+
+func handleCells(backend Backend, msg Decoder, peer *Peer) error {
+	var cellsResponse CellsPacket
+	if err := msg.Decode(&cellsResponse); err != nil {
+		return err
+	}
+	tresp := tracker.Response{
+		ID:      cellsResponse.RequestId,
+		MsgCode: CellsMsg,
+		Size:    cellsResponse.CellsResponse.Cells.Len(),
+	}
+	if err := peer.tracker.Fulfil(tresp); err != nil {
+		return fmt.Errorf("Cells: %w", err)
+	}
+	return backend.Handle(peer, &cellsResponse.CellsResponse)
+}
+
+// handleGetBlockAccessLists serves a GetBlockAccessLists request.
+func handleGetBlockAccessLists(backend Backend, msg Decoder, peer *Peer) error {
+	var query GetBlockAccessListsPacket
+	if err := msg.Decode(&query); err != nil {
+		return err
+	}
+	response := serviceGetBlockAccessListsQuery(backend.Chain(), query.GetBlockAccessListsRequest)
+	return peer.ReplyBlockAccessLists(query.RequestId, response)
+}
+
+// serviceGetBlockAccessListsQuery assembles the response to a BAL query.
+// Unavailable BALs are returned as empty list entries.
+func serviceGetBlockAccessListsQuery(chain *core.BlockChain, query GetBlockAccessListsRequest) rlp.RawList[rlp.RawValue] {
+	var (
+		bytes int
+		bals  rlp.RawList[rlp.RawValue]
+	)
+	for _, hash := range query {
+		if bytes >= softResponseLimit || bals.Len() >= maxBALsServe {
+			break
+		}
+		data := chain.GetAccessListRLP(hash)
+		if len(data) == 0 {
+			// The signal for missing BAL is the empty string, because
+			// an empty list is also a valid BAL.
+			bals.AppendRaw(rlp.EmptyString)
+			continue
+		}
+		bals.AppendRaw(data)
+		bytes += len(data)
+	}
+	return bals
+}
+
+// handleBlockAccessLists processes an incoming BlockAccessLists response,
+// validates it against the request tracker, and dispatches it to the waiting caller.
+func handleBlockAccessLists(backend Backend, msg Decoder, peer *Peer) error {
+	res := new(BlockAccessListPacket)
+	if err := msg.Decode(res); err != nil {
+		return err
+	}
+	tresp := tracker.Response{ID: res.RequestId, MsgCode: BlockAccessListsMsg, Size: res.List.Len()}
+	if err := peer.tracker.Fulfil(tresp); err != nil {
+		return fmt.Errorf("BlockAccessLists: %w", err)
+	}
+	bals, err := res.List.Items()
+	if err != nil {
+		return fmt.Errorf("BlockAccessLists: %w", err)
+	}
+
+	metadata := func() interface{} {
+		hashes := make([]common.Hash, len(bals))
+		for i := range bals {
+			// Unavailable BALs (signaled by the empty string) are marked
+			// with the zero hash
+			if bytes.Equal(bals[i], rlp.EmptyString) {
+				continue
+			}
+			hashes[i] = crypto.Keccak256Hash(bals[i])
+		}
+		return hashes
+	}
+
+	return peer.dispatchResponse(&Response{
+		id:   res.RequestId,
+		code: BlockAccessListsMsg,
+		Res:  (*BlockAccessListResponse)(&bals),
+	}, metadata)
 }

@@ -106,6 +106,16 @@ func (s *Suite) SnapTests() []utesting.Test {
 	}
 }
 
+// Snap2Tests returns the list of tests for the snap/2 protocol (EIP-8189).
+// These tests require the peer to advertise and negotiate snap/2.
+func (s *Suite) Snap2Tests() []utesting.Test {
+	return []utesting.Test{
+		{Name: "Status", Fn: s.TestSnap2Status},
+		{Name: "GetBlockAccessLists", Fn: s.TestSnap2GetBlockAccessLists},
+		{Name: "TrieNodesRemoved", Fn: s.TestSnap2TrieNodesRemoved},
+	}
+}
+
 func (s *Suite) TestStatus(t *utesting.T) {
 	t.Log(`This test is just a sanity check. It performs an eth protocol handshake.`)
 	conn, err := s.dialAndPeer(nil)
@@ -338,7 +348,7 @@ func (s *Suite) checkHeadersAgainstChain(req *eth.GetBlockHeadersPacket, resp *e
 }
 
 // collectResponses waits for n messages of type T on the given connection.
-// The messsages are collected according to the 'identity' function.
+// The messages are collected according to the 'identity' function.
 //
 // This function is written in a generic way to handle
 func collectHeaderResponses(conn *Conn, n int, identity func(*eth.BlockHeadersPacket) uint64) (map[uint64]*eth.BlockHeadersPacket, error) {
@@ -413,7 +423,7 @@ func (s *Suite) TestGetBlockBodies(t *utesting.T) {
 		t.Fatalf("error reading block bodies msg: %v", err)
 	}
 	if got, want := resp.RequestId, req.RequestId; got != want {
-		t.Fatalf("unexpected request id in respond", got, want)
+		t.Fatalf("unexpected request id in response: got %d, want %d", got, want)
 	}
 	if resp.List.Len() != len(req.GetBlockBodiesRequest) {
 		t.Fatalf("wrong bodies in response: expected %d bodies, got %d", len(req.GetBlockBodiesRequest), resp.List.Len())
@@ -457,7 +467,7 @@ func (s *Suite) TestGetReceipts(t *utesting.T) {
 			t.Fatalf("error reading block receipts msg: %v", err)
 		}
 		if got, want := resp.RequestId, req.RequestId; got != want {
-			t.Fatalf("unexpected request id in respond", got, want)
+			t.Fatalf("unexpected request id in response: got %d, want %d", got, want)
 		}
 		if resp.List.Len() != len(req.GetReceiptsRequest) {
 			t.Fatalf("wrong receipts in response: expected %d receipts, got %d", len(req.GetReceiptsRequest), resp.List.Len())
@@ -478,7 +488,7 @@ func (s *Suite) TestGetReceipts(t *utesting.T) {
 			t.Fatalf("error reading block receipts msg: %v", err)
 		}
 		if got, want := resp.RequestId, req.RequestId; got != want {
-			t.Fatalf("unexpected request id in respond", got, want)
+			t.Fatalf("unexpected request id in response: got %d, want %d", got, want)
 		}
 		if resp.List.Len() != len(req.GetReceiptsRequest) {
 			t.Fatalf("wrong receipts in response: expected %d receipts, got %d", len(req.GetReceiptsRequest), resp.List.Len())
@@ -535,7 +545,7 @@ func (s *Suite) TestGetLargeReceipts(t *utesting.T) {
 			t.Fatalf("error reading block receipts msg: %v", err)
 		}
 		if got, want := resp.RequestId, req.RequestId; got != want {
-			t.Fatalf("unexpected request id in respond, want: %d, got: %d", got, want)
+			t.Fatalf("unexpected request id in respond, want: %d, got: %d", want, got)
 		}
 
 		receiptLists, _ := resp.List.Items()
@@ -665,7 +675,7 @@ func (s *Suite) TestBlockRangeUpdateInvalid(t *utesting.T) {
 
 func (s *Suite) TestBlockRangeUpdateFuture(t *utesting.T) {
 	t.Log(`This test sends a BlockRangeUpdate that is beyond the chain head.
-The node should accept the update and should not disonnect.`)
+The node should accept the update and should not disconnect.`)
 	conn, err := s.dialAndPeer(nil)
 	if err != nil {
 		t.Fatal(err)
@@ -701,7 +711,7 @@ The node should accept the update and should not disonnect.`)
 
 func (s *Suite) TestBlockRangeUpdateHistoryExp(t *utesting.T) {
 	t.Log(`This test sends a BlockRangeUpdate announcing incomplete (expired) history.
-The node should accept the update and should not disonnect.`)
+The node should accept the update and should not disconnect.`)
 	conn, err := s.dialAndPeer(nil)
 	if err != nil {
 		t.Fatal(err)
@@ -966,7 +976,7 @@ the transactions using a GetPooledTransactions request.`)
 	}
 
 	// Send announcement.
-	ann := eth.NewPooledTransactionHashesPacket{Types: txTypes, Sizes: sizes, Hashes: hashes}
+	ann := eth.NewPooledTransactionHashesPacket71{Types: txTypes, Sizes: sizes, Hashes: hashes}
 	err = conn.Write(ethProto, eth.NewPooledTransactionHashesMsg, ann)
 	if err != nil {
 		t.Fatalf("failed to write to connection: %v", err)
@@ -984,7 +994,7 @@ the transactions using a GetPooledTransactions request.`)
 				t.Fatalf("unexpected number of txs requested: wanted %d, got %d", len(hashes), len(msg.GetPooledTransactionsRequest))
 			}
 			return
-		case *eth.NewPooledTransactionHashesPacket:
+		case *eth.NewPooledTransactionHashesPacket71:
 			continue
 		case *eth.TransactionsPacket:
 			continue
@@ -1003,11 +1013,11 @@ func makeSidecar(data ...byte) *types.BlobTxSidecar {
 	for i := range blobs {
 		blobs[i][0] = data[i]
 		c, _ := kzg4844.BlobToCommitment(&blobs[i])
-		p, _ := kzg4844.ComputeBlobProof(&blobs[i], c)
+		cellProofs, _ := kzg4844.ComputeCellProofs(&blobs[i])
 		commitments = append(commitments, c)
-		proofs = append(proofs, p)
+		proofs = append(proofs, cellProofs...)
 	}
-	return types.NewBlobTxSidecar(types.BlobSidecarVersion0, blobs, commitments, proofs)
+	return types.NewBlobTxSidecar(types.BlobSidecarVersion1, blobs, commitments, proofs)
 }
 
 func (s *Suite) makeBlobTxs(count, blobs int, discriminator byte) (txs types.Transactions) {
@@ -1050,12 +1060,12 @@ func (s *Suite) TestBlobViolations(t *utesting.T) {
 		t2 = s.makeBlobTxs(2, 3, 0x2)
 	)
 	for _, test := range []struct {
-		ann  eth.NewPooledTransactionHashesPacket
+		ann  eth.NewPooledTransactionHashesPacket71
 		resp eth.PooledTransactionsResponse
 	}{
 		// Invalid tx size.
 		{
-			ann: eth.NewPooledTransactionHashesPacket{
+			ann: eth.NewPooledTransactionHashesPacket71{
 				Types:  []byte{types.BlobTxType, types.BlobTxType},
 				Sizes:  []uint32{uint32(t1[0].Size()), uint32(t1[1].Size() + 10)},
 				Hashes: []common.Hash{t1[0].Hash(), t1[1].Hash()},
@@ -1064,7 +1074,7 @@ func (s *Suite) TestBlobViolations(t *utesting.T) {
 		},
 		// Wrong tx type.
 		{
-			ann: eth.NewPooledTransactionHashesPacket{
+			ann: eth.NewPooledTransactionHashesPacket71{
 				Types:  []byte{types.DynamicFeeTxType, types.BlobTxType},
 				Sizes:  []uint32{uint32(t2[0].Size()), uint32(t2[1].Size())},
 				Hashes: []common.Hash{t2[0].Hash(), t2[1].Hash()},
@@ -1193,7 +1203,7 @@ func (s *Suite) testBadBlobTx(t *utesting.T, tx *types.Transaction, badTx *types
 			return
 		}
 
-		ann := eth.NewPooledTransactionHashesPacket{
+		ann := eth.NewPooledTransactionHashesPacket71{
 			Types:  []byte{types.BlobTxType},
 			Sizes:  []uint32{uint32(badTx.Size())},
 			Hashes: []common.Hash{badTx.Hash()},
@@ -1244,7 +1254,7 @@ func (s *Suite) testBadBlobTx(t *utesting.T, tx *types.Transaction, badTx *types
 			return
 		}
 
-		ann := eth.NewPooledTransactionHashesPacket{
+		ann := eth.NewPooledTransactionHashesPacket71{
 			Types:  []byte{types.BlobTxType},
 			Sizes:  []uint32{uint32(tx.Size())},
 			Hashes: []common.Hash{tx.Hash()},

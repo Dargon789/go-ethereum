@@ -215,6 +215,8 @@ func activePrecompiledContracts(rules params.Rules) PrecompiledContracts {
 	switch {
 	case rules.IsUBT:
 		return PrecompiledContractsVerkle
+	case rules.IsBogota:
+		return PrecompiledContractsOsaka
 	case rules.IsOsaka:
 		return PrecompiledContractsOsaka
 	case rules.IsPrague:
@@ -240,6 +242,8 @@ func ActivePrecompiledContracts(rules params.Rules) PrecompiledContracts {
 // ActivePrecompiles returns the precompile addresses enabled with the current configuration.
 func ActivePrecompiles(rules params.Rules) []common.Address {
 	switch {
+	case rules.IsBogota:
+		return PrecompiledAddressesOsaka
 	case rules.IsOsaka:
 		return PrecompiledAddressesOsaka
 	case rules.IsPrague:
@@ -264,9 +268,8 @@ func ActivePrecompiles(rules params.Rules) []common.Address {
 // - any error that occurred
 func RunPrecompiledContract(stateDB StateDB, p PrecompiledContract, address common.Address, input []byte, gas GasBudget, logger *tracing.Hooks, rules params.Rules) (ret []byte, remaining GasBudget, err error) {
 	gasCost := p.RequiredGas(input)
-	prior, ok := gas.Charge(GasCosts{RegularGas: gasCost})
+	prior, ok := gas.ChargeRegular(gasCost)
 	if !ok {
-		gas.Exhaust()
 		return nil, gas, ErrOutOfGas
 	}
 	if logger.HasGasHook() {
