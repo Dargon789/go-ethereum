@@ -51,8 +51,8 @@ var (
 // Users can specify the maximum number of blobs per block if necessary.
 func (miner *Miner) maxBlobsPerBlock(time uint64) int {
 	maxBlobs := eip4844.MaxBlobsPerBlock(miner.chainConfig, time)
-	if miner.config.MaxBlobsPerBlock != 0 {
-		maxBlobs = miner.config.MaxBlobsPerBlock
+	if configured := miner.config.MaxBlobsPerBlock; configured != 0 && configured < maxBlobs {
+		maxBlobs = configured
 	}
 	return maxBlobs
 }
@@ -326,7 +326,7 @@ func (miner *Miner) prepareWork(ctx context.Context, genParams *generateParams, 
 		return nil, err
 	}
 	// Run pre-execution system calls
-	env.bal.Merge(core.PreExecution(ctx, header.ParentBeaconRoot, header.ParentHash, miner.chainConfig, env.evm, header.Number, header.Time))
+	env.bal.Merge(core.PreExecution(ctx, header.ParentBeaconRoot, parent, miner.chainConfig, env.evm, header.Number, header.Time))
 	return env, nil
 }
 
