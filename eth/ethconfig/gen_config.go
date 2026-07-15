@@ -34,6 +34,7 @@ func (c Config) MarshalTOML() (interface{}, error) {
 		TrienodeHistory         int64                  `toml:",omitempty"`
 		NodeFullValueCheckpoint uint32                 `toml:",omitempty"`
 		StateScheme             string                 `toml:",omitempty"`
+		BinTrieGroupDepth       int                    `toml:",omitempty"`
 		RequiredBlocks          map[uint64]common.Hash `toml:"-"`
 		SlowBlockThreshold      time.Duration          `toml:",omitempty"`
 		SkipBcVersionCheck      bool                   `toml:"-"`
@@ -56,15 +57,18 @@ func (c Config) MarshalTOML() (interface{}, error) {
 		EnableWitnessStats      bool
 		StatelessSelfValidation bool
 		EnableStateSizeTracking bool
+		SnapV2                  bool
 		VMTrace                 string
 		VMTraceJsonConfig       string
 		RPCGasCap               uint64
 		RPCEVMTimeout           time.Duration
 		RPCTxFeeCap             float64
+		EngineMaxReorgDepth     uint64        `toml:",omitempty"`
 		OverrideOsaka           *uint64       `toml:",omitempty"`
+		OverrideAmsterdam       *uint64       `toml:",omitempty"`
 		OverrideBPO1            *uint64       `toml:",omitempty"`
 		OverrideBPO2            *uint64       `toml:",omitempty"`
-		OverrideVerkle          *uint64       `toml:",omitempty"`
+		OverrideUBT             *uint64       `toml:",omitempty"`
 		TxSyncDefaultTimeout    time.Duration `toml:",omitempty"`
 		TxSyncMaxTimeout        time.Duration `toml:",omitempty"`
 		RangeLimit              uint64        `toml:",omitempty"`
@@ -87,6 +91,7 @@ func (c Config) MarshalTOML() (interface{}, error) {
 	enc.TrienodeHistory = c.TrienodeHistory
 	enc.NodeFullValueCheckpoint = c.NodeFullValueCheckpoint
 	enc.StateScheme = c.StateScheme
+	enc.BinTrieGroupDepth = c.BinTrieGroupDepth
 	enc.RequiredBlocks = c.RequiredBlocks
 	enc.SlowBlockThreshold = c.SlowBlockThreshold
 	enc.SkipBcVersionCheck = c.SkipBcVersionCheck
@@ -109,15 +114,18 @@ func (c Config) MarshalTOML() (interface{}, error) {
 	enc.EnableWitnessStats = c.EnableWitnessStats
 	enc.StatelessSelfValidation = c.StatelessSelfValidation
 	enc.EnableStateSizeTracking = c.EnableStateSizeTracking
+	enc.SnapV2 = c.SnapV2
 	enc.VMTrace = c.VMTrace
 	enc.VMTraceJsonConfig = c.VMTraceJsonConfig
 	enc.RPCGasCap = c.RPCGasCap
 	enc.RPCEVMTimeout = c.RPCEVMTimeout
 	enc.RPCTxFeeCap = c.RPCTxFeeCap
+	enc.EngineMaxReorgDepth = c.EngineMaxReorgDepth
 	enc.OverrideOsaka = c.OverrideOsaka
+	enc.OverrideAmsterdam = c.OverrideAmsterdam
 	enc.OverrideBPO1 = c.OverrideBPO1
 	enc.OverrideBPO2 = c.OverrideBPO2
-	enc.OverrideVerkle = c.OverrideVerkle
+	enc.OverrideUBT = c.OverrideUBT
 	enc.TxSyncDefaultTimeout = c.TxSyncDefaultTimeout
 	enc.TxSyncMaxTimeout = c.TxSyncMaxTimeout
 	enc.RangeLimit = c.RangeLimit
@@ -144,6 +152,7 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		TrienodeHistory         *int64                 `toml:",omitempty"`
 		NodeFullValueCheckpoint *uint32                `toml:",omitempty"`
 		StateScheme             *string                `toml:",omitempty"`
+		BinTrieGroupDepth       *int                   `toml:",omitempty"`
 		RequiredBlocks          map[uint64]common.Hash `toml:"-"`
 		SlowBlockThreshold      *time.Duration         `toml:",omitempty"`
 		SkipBcVersionCheck      *bool                  `toml:"-"`
@@ -166,15 +175,18 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		EnableWitnessStats      *bool
 		StatelessSelfValidation *bool
 		EnableStateSizeTracking *bool
+		SnapV2                  *bool
 		VMTrace                 *string
 		VMTraceJsonConfig       *string
 		RPCGasCap               *uint64
 		RPCEVMTimeout           *time.Duration
 		RPCTxFeeCap             *float64
+		EngineMaxReorgDepth     *uint64        `toml:",omitempty"`
 		OverrideOsaka           *uint64        `toml:",omitempty"`
+		OverrideAmsterdam       *uint64        `toml:",omitempty"`
 		OverrideBPO1            *uint64        `toml:",omitempty"`
 		OverrideBPO2            *uint64        `toml:",omitempty"`
-		OverrideVerkle          *uint64        `toml:",omitempty"`
+		OverrideUBT             *uint64        `toml:",omitempty"`
 		TxSyncDefaultTimeout    *time.Duration `toml:",omitempty"`
 		TxSyncMaxTimeout        *time.Duration `toml:",omitempty"`
 		RangeLimit              *uint64        `toml:",omitempty"`
@@ -233,6 +245,9 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	}
 	if dec.StateScheme != nil {
 		c.StateScheme = *dec.StateScheme
+	}
+	if dec.BinTrieGroupDepth != nil {
+		c.BinTrieGroupDepth = *dec.BinTrieGroupDepth
 	}
 	if dec.RequiredBlocks != nil {
 		c.RequiredBlocks = dec.RequiredBlocks
@@ -300,6 +315,9 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	if dec.EnableStateSizeTracking != nil {
 		c.EnableStateSizeTracking = *dec.EnableStateSizeTracking
 	}
+	if dec.SnapV2 != nil {
+		c.SnapV2 = *dec.SnapV2
+	}
 	if dec.VMTrace != nil {
 		c.VMTrace = *dec.VMTrace
 	}
@@ -315,8 +333,14 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	if dec.RPCTxFeeCap != nil {
 		c.RPCTxFeeCap = *dec.RPCTxFeeCap
 	}
+	if dec.EngineMaxReorgDepth != nil {
+		c.EngineMaxReorgDepth = *dec.EngineMaxReorgDepth
+	}
 	if dec.OverrideOsaka != nil {
 		c.OverrideOsaka = dec.OverrideOsaka
+	}
+	if dec.OverrideAmsterdam != nil {
+		c.OverrideAmsterdam = dec.OverrideAmsterdam
 	}
 	if dec.OverrideBPO1 != nil {
 		c.OverrideBPO1 = dec.OverrideBPO1
@@ -324,8 +348,8 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	if dec.OverrideBPO2 != nil {
 		c.OverrideBPO2 = dec.OverrideBPO2
 	}
-	if dec.OverrideVerkle != nil {
-		c.OverrideVerkle = dec.OverrideVerkle
+	if dec.OverrideUBT != nil {
+		c.OverrideUBT = dec.OverrideUBT
 	}
 	if dec.TxSyncDefaultTimeout != nil {
 		c.TxSyncDefaultTimeout = *dec.TxSyncDefaultTimeout

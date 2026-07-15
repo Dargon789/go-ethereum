@@ -35,6 +35,7 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/miner"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/ethereum/go-ethereum/triedb/pathdb"
 )
 
@@ -59,11 +60,12 @@ var Defaults = Config{
 	StateHistory:            pathdb.Defaults.StateHistory,
 	TrienodeHistory:         pathdb.Defaults.TrienodeHistory,
 	NodeFullValueCheckpoint: pathdb.Defaults.FullValueCheckpoint,
-	DatabaseCache:           512,
-	TrieCleanCache:          154,
-	TrieDirtyCache:          256,
+	BinTrieGroupDepth:       triedb.DefaultBinTrieGroupDepth,
+	DatabaseCache:           2048,
+	TrieCleanCache:          614,
+	TrieDirtyCache:          1024,
+	SnapshotCache:           409,
 	TrieTimeout:             60 * time.Minute,
-	SnapshotCache:           102,
 	FilterLogCacheSize:      32,
 	LogQueryLimit:           1000,
 	Miner:                   miner.DefaultConfig,
@@ -73,6 +75,7 @@ var Defaults = Config{
 	RPCEVMTimeout:           5 * time.Second,
 	GPO:                     FullNodeGPO,
 	RPCTxFeeCap:             1, // 1 ether
+	EngineMaxReorgDepth:     32,
 	TxSyncDefaultTimeout:    20 * time.Second,
 	TxSyncMaxTimeout:        1 * time.Minute,
 	SlowBlockThreshold:      -1, // Disabled by default; set via --debug.logslowblock flag
@@ -124,6 +127,11 @@ type Config struct {
 	// nodes on top. It can be 'hash', 'path', or none which means use the scheme
 	// consistent with persistent state.
 	StateScheme string `toml:",omitempty"`
+
+	// BinTrieGroupDepth is the number of levels per serialized group in binary trie.
+	// Valid values are 1-8, with 8 being the default (byte-aligned groups).
+	// Lower values create smaller groups with more nodes.
+	BinTrieGroupDepth int `toml:",omitempty"`
 
 	// RequiredBlocks is a set of block number -> hash mappings which must be in the
 	// canonical chain of all remote peers. Setting the option makes geth verify the
@@ -177,6 +185,11 @@ type Config struct {
 	// Enables tracking of state size
 	EnableStateSizeTracking bool
 
+	// SnapV2 enables the experimental snap/2 (EIP-8189, BAL-based) sync protocol:
+	// the node advertises snap/2 on the wire and uses the snap/2 state syncer.
+	// It is not safe to enable on public networks yet.
+	SnapV2 bool
+
 	// Enables VM tracing
 	VMTrace           string
 	VMTraceJsonConfig string
@@ -191,8 +204,16 @@ type Config struct {
 	// send-transaction variants. The unit is ether.
 	RPCTxFeeCap float64
 
+	// EngineMaxReorgDepth is the maximum depth the chain head can be rewound
+	// to an already-canonical ancestor by engine API forkchoiceUpdated calls
+	// (0 = no limit).
+	EngineMaxReorgDepth uint64 `toml:",omitempty"`
+
 	// OverrideOsaka (TODO: remove after the fork)
 	OverrideOsaka *uint64 `toml:",omitempty"`
+
+	// OverrideAmsterdam (TODO: remove after the fork)
+	OverrideAmsterdam *uint64 `toml:",omitempty"`
 
 	// OverrideBPO1 (TODO: remove after the fork)
 	OverrideBPO1 *uint64 `toml:",omitempty"`
@@ -200,8 +221,8 @@ type Config struct {
 	// OverrideBPO2 (TODO: remove after the fork)
 	OverrideBPO2 *uint64 `toml:",omitempty"`
 
-	// OverrideVerkle (TODO: remove after the fork)
-	OverrideVerkle *uint64 `toml:",omitempty"`
+	// OverrideUBT (TODO: remove after the fork)
+	OverrideUBT *uint64 `toml:",omitempty"`
 
 	// EIP-7966: eth_sendRawTransactionSync timeouts
 	TxSyncDefaultTimeout time.Duration `toml:",omitempty"`

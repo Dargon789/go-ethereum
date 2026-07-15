@@ -67,6 +67,7 @@ var DefaultConfig = Config{
 	WSModules:            []string{"net", "web3"},
 	BatchRequestLimit:    1000,
 	BatchResponseMaxSize: 25 * 1000 * 1000,
+	HTTPBodyLimit:        5 * 1024 * 1024,
 	GraphQLVirtualHosts:  []string{"localhost"},
 	P2P: p2p.Config{
 		ListenAddr:  ":30303",
@@ -76,6 +77,9 @@ var DefaultConfig = Config{
 		DiscoveryV5: true,
 	},
 	DBEngine: "", // Use whatever exists, will default to Pebble if non-existent and supported
+	OpenTelemetry: OpenTelemetryConfig{
+		SampleRatio: 1.0,
+	},
 }
 
 // DefaultDataDir is the default data directory to use for the databases and other

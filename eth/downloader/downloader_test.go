@@ -17,7 +17,6 @@
 package downloader
 
 import (
-	"fmt"
 	"math/big"
 	"sync"
 	"sync/atomic"
@@ -33,7 +32,7 @@ import (
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/eth/protocols/eth"
 	"github.com/ethereum/go-ethereum/eth/protocols/snap"
-	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -42,6 +41,7 @@ import (
 
 // downloadTester is a test simulator for mocking out local block chain.
 type downloadTester struct {
+	db         ethdb.Database
 	chain      *core.BlockChain
 	downloader *Downloader
 
@@ -54,8 +54,14 @@ func newTester(t *testing.T, mode ethconfig.SyncMode) *downloadTester {
 	return newTesterWithNotification(t, mode, nil)
 }
 
-// newTesterWithNotification creates a new downloader test mocker.
+// newTesterWithNotification creates a new downloader test mocker (snap/1).
 func newTesterWithNotification(t *testing.T, mode ethconfig.SyncMode, success func()) *downloadTester {
+	return newTesterWithSnap(t, mode, success, false)
+}
+
+// newTesterWithSnap is like newTesterWithNotification but selects the snap/2
+// state syncer when snapV2 is set.
+func newTesterWithSnap(t *testing.T, mode ethconfig.SyncMode, success func(), snapV2 bool) *downloadTester {
 	db, err := rawdb.Open(rawdb.NewMemoryDatabase(), rawdb.OpenOptions{})
 	if err != nil {
 		panic(err)
@@ -73,10 +79,11 @@ func newTesterWithNotification(t *testing.T, mode ethconfig.SyncMode, success fu
 		panic(err)
 	}
 	tester := &downloadTester{
+		db:    db,
 		chain: chain,
 		peers: make(map[string]*downloadTesterPeer),
 	}
-	tester.downloader = New(db, mode, new(event.TypeMux), tester.chain, tester.dropPeer, success)
+	tester.downloader = New(db, mode, tester.chain, tester.dropPeer, success, snapV2)
 	return tester
 }
 
@@ -97,13 +104,14 @@ func (dl *downloadTester) newPeer(id string, version uint, blocks []*types.Block
 		id:             id,
 		chain:          newTestBlockchain(blocks),
 		withholdBodies: make(map[common.Hash]struct{}),
+		dropped:        make(chan error, 1),
 	}
 	dl.peers[id] = peer
 
 	if err := dl.downloader.RegisterPeer(id, version, peer); err != nil {
 		panic(err)
 	}
-	if err := dl.downloader.SnapSyncer.Register(peer); err != nil {
+	if err := dl.downloader.snapSyncer.Register(peer); err != nil {
 		panic(err)
 	}
 	return peer
@@ -115,15 +123,18 @@ func (dl *downloadTester) dropPeer(id string) {
 	defer dl.lock.Unlock()
 
 	delete(dl.peers, id)
-	dl.downloader.SnapSyncer.Unregister(id)
+	dl.downloader.snapSyncer.Unregister(id)
 	dl.downloader.UnregisterPeer(id)
 }
 
 type downloadTesterPeer struct {
 	dl             *downloadTester
 	withholdBodies map[common.Hash]struct{}
+	corruptBodies  bool // if set, the peer serves incorrect blocks
 	id             string
 	chain          *core.BlockChain
+
+	dropped chan error // signaled when res.Done receives an error
 }
 
 func unmarshalRlpHeaders(rlpdata []rlp.RawValue) []*types.Header {
@@ -214,10 +225,12 @@ func (dlp *downloadTesterPeer) RequestHeadersByNumber(origin uint64, amount int,
 func (dlp *downloadTesterPeer) RequestBodies(hashes []common.Hash, sink chan *eth.Response) (*eth.Request, error) {
 	blobs := eth.ServiceGetBlockBodiesQuery(dlp.chain, hashes)
 
-	bodies := make([]*eth.BlockBody, len(blobs))
+	bodies := make([]*types.Body, len(blobs))
+	ethbodies := make([]eth.BlockBody, len(blobs))
 	for i, blob := range blobs {
-		bodies[i] = new(eth.BlockBody)
+		bodies[i] = new(types.Body)
 		rlp.DecodeBytes(blob, bodies[i])
+		rlp.DecodeBytes(blob, &ethbodies[i])
 	}
 	var (
 		txsHashes        = make([]common.Hash, len(bodies))
@@ -235,18 +248,33 @@ func (dlp *downloadTesterPeer) RequestBodies(hashes []common.Hash, sink chan *et
 		txsHashes[i] = hash
 		uncleHashes[i] = types.CalcUncleHash(body.Uncles)
 	}
+	if dlp.corruptBodies {
+		for i := range txsHashes {
+			txsHashes[i] = common.Hash{0xff}
+		}
+	}
 	req := &eth.Request{
 		Peer: dlp.id,
 	}
 	res := &eth.Response{
-		Req:  req,
-		Res:  (*eth.BlockBodiesResponse)(&bodies),
-		Meta: [][]common.Hash{txsHashes, uncleHashes, withdrawalHashes},
+		Req: req,
+		Res: (*eth.BlockBodiesResponse)(&ethbodies),
+		Meta: eth.BlockBodyHashes{
+			TransactionRoots: txsHashes,
+			UncleHashes:      uncleHashes,
+			WithdrawalRoots:  withdrawalHashes,
+		},
 		Time: 1,
-		Done: make(chan error, 1), // Ignore the returned status
+		Done: make(chan error),
 	}
 	go func() {
 		sink <- res
+		if err := <-res.Done; err != nil {
+			select {
+			case dlp.dropped <- err:
+			default:
+			}
+		}
 	}()
 	return req, nil
 }
@@ -254,24 +282,25 @@ func (dlp *downloadTesterPeer) RequestBodies(hashes []common.Hash, sink chan *et
 // RequestReceipts constructs a getReceipts method associated with a particular
 // peer in the download tester. The returned function can be used to retrieve
 // batches of block receipts from the particularly requested peer.
-func (dlp *downloadTesterPeer) RequestReceipts(hashes []common.Hash, sink chan *eth.Response) (*eth.Request, error) {
-	blobs := eth.ServiceGetReceiptsQuery68(dlp.chain, hashes)
+func (dlp *downloadTesterPeer) RequestReceipts(hashes []common.Hash, gasUsed []uint64, timestamps []uint64, sink chan *eth.Response) (*eth.Request, error) {
+	blobs := eth.ServiceGetReceiptsQuery69(dlp.chain, hashes)
+	receipts := make([]types.Receipts, blobs.Len())
 
-	receipts := make([]types.Receipts, len(blobs))
-	for i, blob := range blobs {
-		rlp.DecodeBytes(blob, &receipts[i])
-	}
+	// compute hashes
+	hashes = make([]common.Hash, blobs.Len())
 	hasher := trie.NewStackTrie(nil)
-	hashes = make([]common.Hash, len(receipts))
-	for i, receipt := range receipts {
-		hashes[i] = types.DeriveSha(receipt, hasher)
+	receiptLists, err := blobs.Items()
+	if err != nil {
+		panic(err)
 	}
-	req := &eth.Request{
-		Peer: dlp.id,
+	for i, rl := range receiptLists {
+		hashes[i] = types.DeriveSha(rl.Derivable(), hasher)
 	}
+
+	// deliver the response right away
 	resp := eth.ReceiptsRLPResponse(types.EncodeBlockReceiptLists(receipts))
 	res := &eth.Response{
-		Req:  req,
+		Req:  &eth.Request{Peer: dlp.id},
 		Res:  &resp,
 		Meta: hashes,
 		Time: 1,
@@ -280,7 +309,7 @@ func (dlp *downloadTesterPeer) RequestReceipts(hashes []common.Hash, sink chan *
 	go func() {
 		sink <- res
 	}()
-	return req, nil
+	return res.Req, nil
 }
 
 // ID retrieves the peer's unique identifier.
@@ -290,14 +319,14 @@ func (dlp *downloadTesterPeer) ID() string {
 
 // RequestAccountRange fetches a batch of accounts rooted in a specific account
 // trie, starting with the origin.
-func (dlp *downloadTesterPeer) RequestAccountRange(id uint64, root, origin, limit common.Hash, bytes uint64) error {
+func (dlp *downloadTesterPeer) RequestAccountRange(id uint64, root, origin, limit common.Hash, bytes int) error {
 	// Create the request and service it
 	req := &snap.GetAccountRangePacket{
 		ID:     id,
 		Root:   root,
 		Origin: origin,
 		Limit:  limit,
-		Bytes:  bytes,
+		Bytes:  uint64(bytes),
 	}
 	slimaccs, proofs := snap.ServiceGetAccountRangeQuery(dlp.chain, req)
 
@@ -309,14 +338,14 @@ func (dlp *downloadTesterPeer) RequestAccountRange(id uint64, root, origin, limi
 	}
 	hashes, accounts, _ := res.Unpack()
 
-	go dlp.dl.downloader.SnapSyncer.OnAccounts(dlp, id, hashes, accounts, proofs)
+	go dlp.dl.downloader.snapSyncer.OnAccounts(dlp, id, hashes, accounts, proofs)
 	return nil
 }
 
 // RequestStorageRanges fetches a batch of storage slots belonging to one or
 // more accounts. If slots from only one account is requested, an origin marker
 // may also be used to retrieve from there.
-func (dlp *downloadTesterPeer) RequestStorageRanges(id uint64, root common.Hash, accounts []common.Hash, origin, limit []byte, bytes uint64) error {
+func (dlp *downloadTesterPeer) RequestStorageRanges(id uint64, root common.Hash, accounts []common.Hash, origin, limit []byte, bytes int) error {
 	// Create the request and service it
 	req := &snap.GetStorageRangesPacket{
 		ID:       id,
@@ -324,7 +353,7 @@ func (dlp *downloadTesterPeer) RequestStorageRanges(id uint64, root common.Hash,
 		Root:     root,
 		Origin:   origin,
 		Limit:    limit,
-		Bytes:    bytes,
+		Bytes:    uint64(bytes),
 	}
 	storage, proofs := snap.ServiceGetStorageRangesQuery(dlp.chain, req)
 
@@ -336,33 +365,49 @@ func (dlp *downloadTesterPeer) RequestStorageRanges(id uint64, root common.Hash,
 	}
 	hashes, slots := res.Unpack()
 
-	go dlp.dl.downloader.SnapSyncer.OnStorage(dlp, id, hashes, slots, proofs)
+	go dlp.dl.downloader.snapSyncer.OnStorage(dlp, id, hashes, slots, proofs)
 	return nil
 }
 
 // RequestByteCodes fetches a batch of bytecodes by hash.
-func (dlp *downloadTesterPeer) RequestByteCodes(id uint64, hashes []common.Hash, bytes uint64) error {
+func (dlp *downloadTesterPeer) RequestByteCodes(id uint64, hashes []common.Hash, bytes int) error {
 	req := &snap.GetByteCodesPacket{
 		ID:     id,
 		Hashes: hashes,
-		Bytes:  bytes,
+		Bytes:  uint64(bytes),
 	}
 	codes := snap.ServiceGetByteCodesQuery(dlp.chain, req)
-	go dlp.dl.downloader.SnapSyncer.OnByteCodes(dlp, id, codes)
+	go dlp.dl.downloader.snapSyncer.OnByteCodes(dlp, id, codes)
 	return nil
 }
 
-// RequestTrieNodes fetches a batch of account or storage trie nodes rooted in
-// a specific state trie.
-func (dlp *downloadTesterPeer) RequestTrieNodes(id uint64, root common.Hash, paths []snap.TrieNodePathSet, bytes uint64) error {
+// RequestTrieNodes fetches a batch of trie nodes (snap/1 healing). snap/2 never
+// issues these, but the method is required to satisfy snap.SyncPeerV2.
+func (dlp *downloadTesterPeer) RequestTrieNodes(id uint64, root common.Hash, count int, paths []snap.TrieNodePathSet, bytes int) error {
+	encPaths, err := rlp.EncodeToRawList(paths)
+	if err != nil {
+		panic(err)
+	}
 	req := &snap.GetTrieNodesPacket{
 		ID:    id,
 		Root:  root,
-		Paths: paths,
-		Bytes: bytes,
+		Paths: encPaths,
+		Bytes: uint64(bytes),
 	}
-	nodes, _ := snap.ServiceGetTrieNodesQuery(dlp.chain, req, time.Now())
-	go dlp.dl.downloader.SnapSyncer.OnTrieNodes(dlp, id, nodes)
+	nodes, _ := snap.ServiceGetTrieNodesQuery(dlp.chain, req)
+	go dlp.dl.downloader.snapSyncer.OnTrieNodes(dlp, id, nodes)
+	return nil
+}
+
+// RequestAccessLists fetches a batch of BALs by block hash.
+func (dlp *downloadTesterPeer) RequestAccessLists(id uint64, hashes []common.Hash, bytes int) error {
+	req := &snap.GetAccessListsPacket{
+		ID:     id,
+		Hashes: hashes,
+		Bytes:  uint64(bytes),
+	}
+	als := snap.ServiceGetAccessListsQuery(dlp.chain, req)
+	go dlp.dl.downloader.snapSyncer.OnAccessLists(dlp, id, als)
 	return nil
 }
 
@@ -389,14 +434,15 @@ func assertOwnChain(t *testing.T, tester *downloadTester, length int) {
 	}
 }
 
-func TestCanonicalSynchronisation68Full(t *testing.T) { testCanonSync(t, eth.ETH68, FullSync) }
-func TestCanonicalSynchronisation68Snap(t *testing.T) { testCanonSync(t, eth.ETH68, SnapSync) }
+func TestCanonicalSynchronisationFull(t *testing.T)   { testCanonSync(t, eth.ETH69, FullSync, false) }
+func TestCanonicalSynchronisationSnap(t *testing.T)   { testCanonSync(t, eth.ETH69, SnapSync, false) }
+func TestCanonicalSynchronisationSnapV2(t *testing.T) { testCanonSync(t, eth.ETH69, SnapSync, true) }
 
-func testCanonSync(t *testing.T, protocol uint, mode SyncMode) {
+func testCanonSync(t *testing.T, protocol uint, mode SyncMode, snapV2 bool) {
 	success := make(chan struct{})
-	tester := newTesterWithNotification(t, mode, func() {
+	tester := newTesterWithSnap(t, mode, func() {
 		close(success)
-	})
+	}, snapV2)
 	defer tester.terminate()
 
 	// Create a small enough block chain to download
@@ -417,8 +463,8 @@ func testCanonSync(t *testing.T, protocol uint, mode SyncMode) {
 
 // Tests that if a large batch of blocks are being downloaded, it is throttled
 // until the cached blocks are retrieved.
-func TestThrottling68Full(t *testing.T) { testThrottling(t, eth.ETH68, FullSync) }
-func TestThrottling68Snap(t *testing.T) { testThrottling(t, eth.ETH68, SnapSync) }
+func TestThrottlingFull(t *testing.T) { testThrottling(t, eth.ETH69, FullSync) }
+func TestThrottlingSnap(t *testing.T) { testThrottling(t, eth.ETH69, SnapSync) }
 
 func testThrottling(t *testing.T, protocol uint, mode SyncMode) {
 	tester := newTester(t, mode)
@@ -495,8 +541,8 @@ func testThrottling(t *testing.T, protocol uint, mode SyncMode) {
 }
 
 // Tests that a canceled download wipes all previously accumulated state.
-func TestCancel68Full(t *testing.T) { testCancel(t, eth.ETH68, FullSync) }
-func TestCancel68Snap(t *testing.T) { testCancel(t, eth.ETH68, SnapSync) }
+func TestCancelFull(t *testing.T) { testCancel(t, eth.ETH69, FullSync) }
+func TestCancelSnap(t *testing.T) { testCancel(t, eth.ETH69, SnapSync) }
 
 func testCancel(t *testing.T, protocol uint, mode SyncMode) {
 	complete := make(chan struct{})
@@ -525,49 +571,10 @@ func testCancel(t *testing.T, protocol uint, mode SyncMode) {
 	}
 }
 
-// Tests that synchronisations behave well in multi-version protocol environments
-// and not wreak havoc on other nodes in the network.
-func TestMultiProtoSynchronisation68Full(t *testing.T) { testMultiProtoSync(t, eth.ETH68, FullSync) }
-func TestMultiProtoSynchronisation68Snap(t *testing.T) { testMultiProtoSync(t, eth.ETH68, SnapSync) }
-
-func testMultiProtoSync(t *testing.T, protocol uint, mode SyncMode) {
-	complete := make(chan struct{})
-	success := func() {
-		close(complete)
-	}
-	tester := newTesterWithNotification(t, mode, success)
-	defer tester.terminate()
-
-	// Create a small enough block chain to download
-	chain := testChainBase.shorten(blockCacheMaxItems - 15)
-
-	// Create peers of every type
-	tester.newPeer("peer 68", eth.ETH68, chain.blocks[1:])
-
-	if err := tester.downloader.BeaconSync(chain.blocks[len(chain.blocks)-1].Header(), nil); err != nil {
-		t.Fatalf("failed to start beacon sync: %v", err)
-	}
-	select {
-	case <-complete:
-		break
-	case <-time.NewTimer(time.Second * 3).C:
-		t.Fatalf("Failed to sync chain in three seconds")
-	}
-	assertOwnChain(t, tester, len(chain.blocks))
-
-	// Check that no peers have been dropped off
-	for _, version := range []int{68} {
-		peer := fmt.Sprintf("peer %d", version)
-		if _, ok := tester.peers[peer]; !ok {
-			t.Errorf("%s dropped", peer)
-		}
-	}
-}
-
 // Tests that if a block is empty (e.g. header only), no body request should be
 // made, and instead the header should be assembled into a whole block in itself.
-func TestEmptyShortCircuit68Full(t *testing.T) { testEmptyShortCircuit(t, eth.ETH68, FullSync) }
-func TestEmptyShortCircuit68Snap(t *testing.T) { testEmptyShortCircuit(t, eth.ETH68, SnapSync) }
+func TestEmptyShortCircuitFull(t *testing.T) { testEmptyShortCircuit(t, eth.ETH69, FullSync) }
+func TestEmptyShortCircuitSnap(t *testing.T) { testEmptyShortCircuit(t, eth.ETH69, SnapSync) }
 
 func testEmptyShortCircuit(t *testing.T, protocol uint, mode SyncMode) {
 	success := make(chan struct{})
@@ -635,8 +642,8 @@ func checkProgress(t *testing.T, d *Downloader, stage string, want ethereum.Sync
 
 // Tests that peers below a pre-configured checkpoint block are prevented from
 // being fast-synced from, avoiding potential cheap eclipse attacks.
-func TestBeaconSync68Full(t *testing.T) { testBeaconSync(t, eth.ETH68, FullSync) }
-func TestBeaconSync68Snap(t *testing.T) { testBeaconSync(t, eth.ETH68, SnapSync) }
+func TestBeaconSyncFull(t *testing.T) { testBeaconSync(t, eth.ETH69, FullSync) }
+func TestBeaconSyncSnap(t *testing.T) { testBeaconSync(t, eth.ETH69, SnapSync) }
 
 func testBeaconSync(t *testing.T, protocol uint, mode SyncMode) {
 	var cases = []struct {
@@ -679,10 +686,82 @@ func testBeaconSync(t *testing.T, protocol uint, mode SyncMode) {
 	}
 }
 
+// TestBeaconSyncRepairFork verifies the end-to-end repair of non-canonical block
+// data. The local node sits on fork A, but fork B's blocks below the local head
+// are also present by hash (no canonical mapping), as if imported optimistically
+// via the engine API. When the beacon chain switches to fork B, sync must not
+// anchor on the non-canonical fork-B data; it has to descend to the real common
+// ancestor and re-deliver everything, ending with the full fork-B chain present
+// and canonical at every height - for both snap and full sync.
+func TestBeaconSyncRepairForkFull(t *testing.T) { testBeaconSyncRepairFork(t, eth.ETH69, FullSync) }
+func TestBeaconSyncRepairForkSnap(t *testing.T) { testBeaconSyncRepairFork(t, eth.ETH69, SnapSync) }
+
+func testBeaconSyncRepairFork(t *testing.T, protocol uint, mode SyncMode) {
+	// Reuse the pre-generated fork chains (new chains can't be generated after the
+	// package init). Fork A and fork B share the whole testChainBase prefix and
+	// diverge at height len(testChainBase.blocks); fork B (the beacon target) is
+	// longer, so it wins the reorg. The exact shortenings used here are the ones
+	// registered as peer chains during init.
+	localChain := testChainForkLightA.shorten(len(testChainBase.blocks) + 80)
+	targetChain := testChainForkLightB.shorten(len(testChainBase.blocks) + MaxHeaderFetch)
+
+	forkPoint := uint64(len(testChainBase.blocks)) // first height the forks differ
+	localHead := uint64(len(localChain.blocks) - 1)
+	targetHead := uint64(len(targetChain.blocks) - 1)
+
+	success := make(chan struct{})
+	tester := newTesterWithNotification(t, mode, func() {
+		close(success)
+	})
+	defer tester.terminate()
+
+	tester.newPeer("peer", protocol, targetChain.blocks[1:])
+
+	// Make fork A the local canonical chain.
+	if _, err := tester.chain.InsertChain(localChain.blocks[1 : localHead+1]); err != nil {
+		t.Fatalf("failed to build local chain: %v", err)
+	}
+	// Seed fork B's divergent blocks that sit below the local head as scattered,
+	// non-canonical data: full block data present by hash, but the canonical
+	// mapping at those heights still points at fork A.
+	for n := forkPoint; n <= localHead; n++ {
+		b := targetChain.blocks[n]
+		rawdb.WriteBlock(tester.db, b)
+		rawdb.WriteReceipts(tester.db, b.Hash(), b.NumberU64(), types.Receipts{})
+	}
+
+	if err := tester.downloader.BeaconSync(targetChain.blocks[targetHead].Header(), nil); err != nil {
+		t.Fatalf("failed to beacon-sync chain: %v", err)
+	}
+	select {
+	case <-success:
+	case <-time.NewTimer(10 * time.Second).C:
+		t.Fatalf("failed to sync chain in ten seconds")
+	}
+	// The head must reach fork B's tip.
+	if got := tester.chain.CurrentBlock().Number.Uint64(); got != targetHead {
+		t.Fatalf("synced head mismatch: have %d, want %d", got, targetHead)
+	}
+	// Every height must be canonical to fork B and carry complete block data,
+	// proving the non-canonical fork-A / seed data was fully reorged out.
+	for n := uint64(1); n <= targetHead; n++ {
+		want := targetChain.blocks[n].Hash()
+		if got := rawdb.ReadCanonicalHash(tester.db, n); got != want {
+			t.Fatalf("canonical hash at %d: have %x, want %x", n, got, want)
+		}
+		if !rawdb.HasHeader(tester.db, want, n) || !rawdb.HasBody(tester.db, want, n) {
+			t.Fatalf("incomplete block data at %d after sync", n)
+		}
+		if !rawdb.HasReceipts(tester.db, want, n) {
+			t.Fatalf("missing receipts at %d after sync", n)
+		}
+	}
+}
+
 // Tests that synchronisation progress (origin block number, current block number
 // and highest block number) is tracked and updated correctly.
-func TestSyncProgress68Full(t *testing.T) { testSyncProgress(t, eth.ETH68, FullSync) }
-func TestSyncProgress68Snap(t *testing.T) { testSyncProgress(t, eth.ETH68, SnapSync) }
+func TestSyncProgressFull(t *testing.T) { testSyncProgress(t, eth.ETH69, FullSync) }
+func TestSyncProgressSnap(t *testing.T) { testSyncProgress(t, eth.ETH69, SnapSync) }
 
 func testSyncProgress(t *testing.T, protocol uint, mode SyncMode) {
 	success := make(chan struct{})
@@ -732,5 +811,23 @@ func testSyncProgress(t *testing.T, protocol uint, mode SyncMode) {
 		})
 	case <-time.NewTimer(time.Second * 3).C:
 		t.Fatalf("Failed to sync chain in three seconds")
+	}
+}
+
+func TestInvalidBodyPeerDrop(t *testing.T) {
+	tester := newTester(t, FullSync)
+	defer tester.terminate()
+
+	chain := testChainBase.shorten(blockCacheMaxItems - 15)
+	peer := tester.newPeer("corrupt", eth.ETH69, chain.blocks[1:])
+	peer.corruptBodies = true
+
+	if err := tester.downloader.BeaconSync(chain.blocks[len(chain.blocks)-1].Header(), nil); err != nil {
+		t.Fatalf("failed to beacon-sync chain: %v", err)
+	}
+	select {
+	case <-peer.dropped:
+	case <-time.After(1 * time.Minute):
+		t.Fatal("peer was not dropped")
 	}
 }

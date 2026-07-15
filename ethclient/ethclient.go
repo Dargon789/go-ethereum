@@ -498,7 +498,11 @@ func (ec *Client) SubscribeFilterLogs(ctx context.Context, q ethereum.FilterQuer
 
 func toFilterArg(q ethereum.FilterQuery) (interface{}, error) {
 	arg := map[string]interface{}{}
-	if q.Addresses != nil {
+	// Only include "address" when there are actual address filters.
+	// An empty slice is treated the same as nil (no filter), and omitting
+	// the field avoids sending "address":[] to nodes that reject empty arrays
+	// (e.g. Hedera, some non-Geth implementations).
+	if len(q.Addresses) > 0 {
 		arg["address"] = q.Addresses
 	}
 	if q.Topics != nil {
@@ -835,9 +839,13 @@ type rpcProgress struct {
 	HealedBytecodeBytes    hexutil.Uint64
 	HealingTrienodes       hexutil.Uint64
 	HealingBytecode        hexutil.Uint64
+	SyncedAccessLists      hexutil.Uint64
+	TotalAccessLists       hexutil.Uint64
+	TrieGenProgress        hexutil.Uint64
 	TxIndexFinishedBlocks  hexutil.Uint64
 	TxIndexRemainingBlocks hexutil.Uint64
 	StateIndexRemaining    hexutil.Uint64
+	TrienodeIndexRemaining hexutil.Uint64
 }
 
 func (p *rpcProgress) toSyncProgress() *ethereum.SyncProgress {
@@ -862,9 +870,13 @@ func (p *rpcProgress) toSyncProgress() *ethereum.SyncProgress {
 		HealedBytecodeBytes:    uint64(p.HealedBytecodeBytes),
 		HealingTrienodes:       uint64(p.HealingTrienodes),
 		HealingBytecode:        uint64(p.HealingBytecode),
+		SyncedAccessLists:      uint64(p.SyncedAccessLists),
+		TotalAccessLists:       uint64(p.TotalAccessLists),
+		TrieGenProgress:        uint64(p.TrieGenProgress),
 		TxIndexFinishedBlocks:  uint64(p.TxIndexFinishedBlocks),
 		TxIndexRemainingBlocks: uint64(p.TxIndexRemainingBlocks),
 		StateIndexRemaining:    uint64(p.StateIndexRemaining),
+		TrienodeIndexRemaining: uint64(p.TrienodeIndexRemaining),
 	}
 }
 
@@ -908,6 +920,7 @@ type SimulateCallResult struct {
 	ReturnValue []byte       `json:"returnData"`
 	Logs        []*types.Log `json:"logs"`
 	GasUsed     uint64       `json:"gasUsed"`
+	MaxUsedGas  uint64       `json:"maxUsedGas"`
 	Status      uint64       `json:"status"`
 	Error       *CallError   `json:"error,omitempty"`
 }
@@ -915,6 +928,7 @@ type SimulateCallResult struct {
 type simulateCallResultMarshaling struct {
 	ReturnValue hexutil.Bytes
 	GasUsed     hexutil.Uint64
+	MaxUsedGas  hexutil.Uint64
 	Status      hexutil.Uint64
 }
 

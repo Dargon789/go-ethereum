@@ -213,8 +213,10 @@ func init() {
 
 func activePrecompiledContracts(rules params.Rules) PrecompiledContracts {
 	switch {
-	case rules.IsVerkle:
+	case rules.IsUBT:
 		return PrecompiledContractsVerkle
+	case rules.IsBogota:
+		return PrecompiledContractsOsaka
 	case rules.IsOsaka:
 		return PrecompiledContractsOsaka
 	case rules.IsPrague:
@@ -240,6 +242,8 @@ func ActivePrecompiledContracts(rules params.Rules) PrecompiledContracts {
 // ActivePrecompiles returns the precompile addresses enabled with the current configuration.
 func ActivePrecompiles(rules params.Rules) []common.Address {
 	switch {
+	case rules.IsBogota:
+		return PrecompiledAddressesOsaka
 	case rules.IsOsaka:
 		return PrecompiledAddressesOsaka
 	case rules.IsPrague:
@@ -260,19 +264,24 @@ func ActivePrecompiles(rules params.Rules) []common.Address {
 // RunPrecompiledContract runs and evaluates the output of a precompiled contract.
 // It returns
 // - the returned bytes,
-// - the _remaining_ gas,
+// - the remaining gas budget,
 // - any error that occurred
-func RunPrecompiledContract(p PrecompiledContract, input []byte, suppliedGas uint64, logger *tracing.Hooks) (ret []byte, remainingGas uint64, err error) {
+func RunPrecompiledContract(stateDB StateDB, p PrecompiledContract, address common.Address, input []byte, gas GasBudget, logger *tracing.Hooks, rules params.Rules) (ret []byte, remaining GasBudget, err error) {
 	gasCost := p.RequiredGas(input)
-	if suppliedGas < gasCost {
-		return nil, 0, ErrOutOfGas
+	prior, ok := gas.ChargeRegular(gasCost)
+	if !ok {
+		return nil, gas, ErrOutOfGas
 	}
-	if logger != nil && logger.OnGasChange != nil {
-		logger.OnGasChange(suppliedGas, suppliedGas-gasCost, tracing.GasChangeCallPrecompiledContract)
+	if logger.HasGasHook() {
+		logger.EmitGasChange(prior.AsTracing(), gas.AsTracing(), tracing.GasChangeCallPrecompiledContract)
 	}
-	suppliedGas -= gasCost
+	// Touch the precompile for block-level accessList recording once Amsterdam
+	// fork is activated.
+	if rules.IsAmsterdam {
+		stateDB.Touch(address)
+	}
 	output, err := p.Run(input)
-	return output, suppliedGas, err
+	return output, gas, err
 }
 
 // ecrecover implemented as a native contract.

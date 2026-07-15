@@ -273,7 +273,7 @@ func truncateFromHead(store ethdb.AncientStore, typ historyType, nhead uint64) (
 	if err != nil {
 		return 0, err
 	}
-	otail, err := store.Tail()
+	otail, err := store.Tail(rawdb.DefaultHistoryGroup)
 	if err != nil {
 		return 0, err
 	}
@@ -303,7 +303,7 @@ func truncateFromTail(store ethdb.AncientStore, typ historyType, ntail uint64) (
 	if err != nil {
 		return 0, err
 	}
-	otail, err := store.Tail()
+	otail, err := store.Tail(rawdb.DefaultHistoryGroup)
 	if err != nil {
 		return 0, err
 	}
@@ -315,7 +315,7 @@ func truncateFromTail(store ethdb.AncientStore, typ historyType, ntail uint64) (
 	if otail == ntail {
 		return 0, nil
 	}
-	otail, err = store.TruncateTail(ntail)
+	otail, err = store.TruncateTail(rawdb.DefaultHistoryGroup, ntail)
 	if err != nil {
 		return 0, err
 	}
@@ -376,7 +376,7 @@ func syncHistory(stores ...ethdb.AncientWriter) error {
 // persistent state may appear if the trienode history was disabled during the
 // previous run. This process detects and resolves such gaps, preventing
 // unexpected panics.
-func repairHistory(db ethdb.Database, isVerkle bool, readOnly bool, stateID uint64, enableTrienode bool) (ethdb.ResettableAncientStore, ethdb.ResettableAncientStore, error) {
+func repairHistory(db ethdb.Database, isUBT bool, readOnly bool, stateID uint64, enableTrienode bool) (ethdb.ResettableAncientStore, ethdb.ResettableAncientStore, error) {
 	ancient, err := db.AncientDatadir()
 	if err != nil {
 		// TODO error out if ancient store is disabled. A tons of unit tests
@@ -386,7 +386,7 @@ func repairHistory(db ethdb.Database, isVerkle bool, readOnly bool, stateID uint
 	}
 	// State history is mandatory as it is the key component that ensures
 	// resilience to deep reorgs.
-	states, err := rawdb.NewStateFreezer(ancient, isVerkle, readOnly)
+	states, err := rawdb.NewStateFreezer(ancient, isUBT, readOnly)
 	if err != nil {
 		log.Crit("Failed to open state history freezer", "err", err)
 	}
@@ -395,7 +395,7 @@ func repairHistory(db ethdb.Database, isVerkle bool, readOnly bool, stateID uint
 	// node with state proofs.
 	var trienodes ethdb.ResettableAncientStore
 	if enableTrienode {
-		trienodes, err = rawdb.NewTrienodeFreezer(ancient, isVerkle, readOnly)
+		trienodes, err = rawdb.NewTrienodeFreezer(ancient, isUBT, readOnly)
 		if err != nil {
 			log.Crit("Failed to open trienode history freezer", "err", err)
 		}
@@ -412,28 +412,34 @@ func repairHistory(db ethdb.Database, isVerkle bool, readOnly bool, stateID uint
 	// Truncate excessive history entries in either the state history or
 	// the trienode history, ensuring both histories remain aligned with
 	// the state.
-	head, err := states.Ancients()
+	shead, err := states.Ancients()
 	if err != nil {
 		return nil, nil, err
 	}
-	if stateID > head {
-		return nil, nil, fmt.Errorf("gap between state [#%d] and state history [#%d]", stateID, head)
+	if stateID > shead { // Gap is not permitted in the state history
+		return nil, nil, fmt.Errorf("gap between state [#%d] and state history [#%d]", stateID, shead)
 	}
+	truncTo := min(shead, stateID)
+
 	if trienodes != nil {
-		th, err := trienodes.Ancients()
+		thead, err := trienodes.Ancients()
 		if err != nil {
 			return nil, nil, err
 		}
-		if stateID > th {
-			return nil, nil, fmt.Errorf("gap between state [#%d] and trienode history [#%d]", stateID, th)
-		}
-		if th != head {
-			log.Info("Histories are not aligned with each other", "state", head, "trienode", th)
-			head = min(head, th)
+		if stateID <= thead {
+			truncTo = min(truncTo, thead)
+		} else {
+			if thead == 0 {
+				_, err = trienodes.TruncateTail(rawdb.DefaultHistoryGroup, stateID)
+				if err != nil {
+					return nil, nil, err
+				}
+				log.Warn("Initialized trienode history")
+			} else {
+				return nil, nil, fmt.Errorf("gap between state [#%d] and trienode history [#%d]", stateID, thead)
+			}
 		}
 	}
-	head = min(head, stateID)
-
 	// Truncate the extra history elements above in freezer in case it's not
 	// aligned with the state. It might happen after an unclean shutdown.
 	truncate := func(store ethdb.AncientStore, typ historyType, nhead uint64) {
@@ -448,7 +454,7 @@ func repairHistory(db ethdb.Database, isVerkle bool, readOnly bool, stateID uint
 			log.Warn("Truncated extra histories", "typ", typ, "number", pruned)
 		}
 	}
-	truncate(states, typeStateHistory, head)
-	truncate(trienodes, typeTrienodeHistory, head)
+	truncate(states, typeStateHistory, truncTo)
+	truncate(trienodes, typeTrienodeHistory, truncTo)
 	return states, trienodes, nil
 }
