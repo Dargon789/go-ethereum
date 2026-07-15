@@ -296,6 +296,7 @@ func (bc *BlockChain) GetReceiptsRLP(hash common.Hash) rlp.RawValue {
 	return rawdb.ReadReceiptsRLP(bc.db, hash, number)
 }
 
+// GetAccessListRLP retrieves the block access list of a block in RLP encoding.
 func (bc *BlockChain) GetAccessListRLP(hash common.Hash) rlp.RawValue {
 	number, ok := rawdb.ReadHeaderNumber(bc.db, hash)
 	if !ok {
@@ -394,11 +395,11 @@ func (bc *BlockChain) HasBlockAndState(hash common.Hash, number uint64) bool {
 	return bc.HasState(block.Root())
 }
 
-// stateRecoverable checks if the specified state is recoverable.
+// StateRecoverable checks if the specified state is recoverable.
 // Note, this function assumes the state is not present, because
 // state is not treated as recoverable if it's available, thus
 // false will be returned in this case.
-func (bc *BlockChain) stateRecoverable(root common.Hash) bool {
+func (bc *BlockChain) StateRecoverable(root common.Hash) bool {
 	if bc.triedb.Scheme() == rawdb.HashScheme {
 		return false
 	}

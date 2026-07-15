@@ -97,10 +97,8 @@ func TestExecutionSpecState(t *testing.T) {
 	st := new(testMatcher)
 
 	// Broken tests
-	st.skipLoad(`RevertInCreateInInit`)
-	st.skipLoad(`InitCollisionParis`)
-	st.skipLoad(`dynamicAccountOverwriteEmpty_Paris`)
-	st.skipLoad(`create2collisionStorageParis`)
+	st.skipLoad(`.*eip7610_create_collision/initcollision/.*`)
+	st.skipLoad(`.*eip7610_create_collision/revert_in_create/.*`)
 
 	st.walk(t, executionSpecStateTestDir, func(t *testing.T, name string, test *StateTest) {
 		execStateTest(t, st, test)
@@ -325,10 +323,10 @@ func runBenchmark(b *testing.B, t *StateTest) {
 				b.StartTimer()
 				start := time.Now()
 
-				initialGas := vm.NewGasBudget(msg.GasLimit)
+				initialGas := vm.NewGasBudget(msg.GasLimit, 0)
 
 				// Execute the message.
-				_, leftOverGas, err := evm.Call(sender.Address(), *msg.To, msg.Data, initialGas.Copy(), msg.Value)
+				_, result, err := evm.Call(sender.Address(), *msg.To, msg.Data, initialGas, msg.Value)
 				if err != nil {
 					b.Error(err)
 					return
@@ -337,7 +335,7 @@ func runBenchmark(b *testing.B, t *StateTest) {
 				b.StopTimer()
 				elapsed += uint64(time.Since(start))
 				refund += state.StateDB.GetRefund()
-				gasUsed += leftOverGas.Used(initialGas)
+				gasUsed += result.Used(initialGas)
 
 				state.StateDB.RevertToSnapshot(snapshot)
 			}

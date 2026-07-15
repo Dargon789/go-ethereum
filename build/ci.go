@@ -75,7 +75,7 @@ var (
 
 	// Files that end up in the geth-alltools*.zip archive (and the NSIS installer
 	// dev-tools section). Order matches the historical layout produced by ci.go.
-	allToolsBinaries = []string{"abigen", "evm", "geth", "rlpdump", "clef"}
+	allToolsBinaries = []string{"abigen", "evm", "geth", "rlpdump"}
 
 	// Keeper build targets with their configurations
 	keeperTargets = []struct {
@@ -134,10 +134,6 @@ var (
 		{
 			BinaryName:  "rlpdump",
 			Description: "Developer utility tool that prints RLP structures.",
-		},
-		{
-			BinaryName:  "clef",
-			Description: "Ethereum account management tool.",
 		},
 	}
 
@@ -456,7 +452,7 @@ func doTest(cmdline []string) {
 // downloadSpecTestFixtures downloads and extracts the execution-spec-tests fixtures.
 func downloadSpecTestFixtures(csdb *download.ChecksumDB, cachedir string) string {
 	ext := ".tar.gz"
-	base := "fixtures_develop"
+	base := "fixtures"
 	archivePath := filepath.Join(cachedir, base+ext)
 	if err := csdb.DownloadFileFromKnownURL(archivePath); err != nil {
 		log.Fatal(err)
