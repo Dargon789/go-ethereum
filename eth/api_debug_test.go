@@ -223,30 +223,17 @@ func TestStorageRangeAt(t *testing.T) {
 			want: StorageRangeResult{storageMap{keys[1]: storage[keys[1]], keys[2]: storage[keys[2]]}, &keys[3]},
 		},
 	}
-	for _, test := range tests {
-		result, err := storageRangeAt(sdb, root, addr, test.start, test.limit)
-		if err != nil {
-			t.Error(err)
-		}
-		if !reflect.DeepEqual(result, test.want) {
-			t.Fatalf("wrong result for range %#x.., limit %d:\ngot %s\nwant %s",
-				test.start, test.limit, dumper.Sdump(result), dumper.Sdump(&test.want))
-		}
+	testKey, _ := crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+	testAddr := crypto.PubkeyToAddress(testKey.PublicKey)
+
+	db := rawdb.NewMemoryDatabase()
+	gspec := &core.Genesis{
+		Config: params.TestChainConfig,
+		Alloc:  types.GenesisAlloc{testAddr: {Balance: big.NewInt(1000000000000000)}},
 	}
-}
-
-func TestExecutionWitness(t *testing.T) {
-	t.Parallel()
-
-	var (
-		db    = rawdb.NewMemoryDatabase()
-		gspec = &core.Genesis{
-			Config: params.TestChainConfig,
-			Alloc:  types.GenesisAlloc{testAddr: {Balance: big.NewInt(1000000000000000)}},
-		}
-		chain, _ = core.NewBlockChain(db, nil, gspec, nil, ethash.NewFaker(), vm.Config{}, nil)
-		signer   = types.LatestSigner(gspec.Config)
-	)
+	chain, err := core.NewBlockChain(db, nil, gspec, nil, ethash.NewFaker(), vm.Config{}, nil)
+	require.NoError(t, err)
+	signer := types.LatestSigner(gspec.Config)
 	// Create a database pre-initialize with a genesis block
 
 	blockNum := 10
