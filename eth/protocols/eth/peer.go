@@ -192,12 +192,18 @@ func (p *Peer) AsyncSendTransactions(hashes []common.Hash) {
 // directly as the queueing (memory) and transmission (bandwidth) costs should
 // not be managed directly.
 func (p *Peer) sendPooledTransactionHashes(hashes []common.Hash, types []byte, sizes []uint32, cells types.CustodyBitmap) error {
+	var err error
+	if p.version >= ETH72 {
+		err = p2p.Send(p.rw, NewPooledTransactionHashesMsg, NewPooledTransactionHashesPacket72{Types: types, Sizes: sizes, Hashes: hashes, Mask: cells})
+	} else {
+		err = p2p.Send(p.rw, NewPooledTransactionHashesMsg, NewPooledTransactionHashesPacket71{Types: types, Sizes: sizes, Hashes: hashes})
+	}
+	if err != nil {
+		return err
+	}
 	// Mark all the transactions as known, but ensure we don't overflow our limits
 	p.knownTxs.Add(hashes...)
-	if p.version >= ETH72 {
-		return p2p.Send(p.rw, NewPooledTransactionHashesMsg, NewPooledTransactionHashesPacket72{Types: types, Sizes: sizes, Hashes: hashes, Mask: cells})
-	}
-	return p2p.Send(p.rw, NewPooledTransactionHashesMsg, NewPooledTransactionHashesPacket71{Types: types, Sizes: sizes, Hashes: hashes})
+	return nil
 }
 
 // AsyncSendPooledTransactionHashes queues a list of transactions hashes to eventually
@@ -267,11 +273,9 @@ func (p *Peer) ReplyCells(id uint64, hashes []common.Hash, cells [][]kzg4844.Cel
 	}
 	return p2p.Send(p.rw, CellsMsg, &CellsPacket{
 		RequestId: id,
-		CellsResponse: CellsResponse{
-			Hashes: hashes,
-			Cells:  rawCells,
-			Mask:   mask,
-		},
+		Hashes:    hashes,
+		Cells:     rawCells,
+		Mask:      mask,
 	})
 }
 
@@ -291,10 +295,8 @@ func (p *Peer) RequestPayload(hashes []common.Hash, cell types.CustodyBitmap) er
 	}
 	return p2p.Send(p.rw, GetCellsMsg, &GetCellsRequestPacket{
 		RequestId: id,
-		GetCellsRequest: GetCellsRequest{
-			Hashes: hashes,
-			Mask:   cell,
-		},
+		Hashes:    hashes,
+		Mask:      cell,
 	})
 }
 
