@@ -103,6 +103,7 @@ var (
 		utils.CacheLogSizeFlag,
 		utils.FDLimitFlag,
 		utils.MemoryLimitFlag,
+		utils.GOGCFlag,
 		utils.CryptoKZGFlag,
 		utils.ListenPortFlag,
 		utils.DiscoveryPortFlag,
@@ -208,8 +209,8 @@ var (
 		utils.MetricsInfluxDBTokenFlag,
 		utils.MetricsInfluxDBBucketFlag,
 		utils.MetricsInfluxDBOrganizationFlag,
-		utils.StateSizeTrackingFlag,
 		utils.SnapV2Flag,
+		utils.StateSizeTrackingFlag, // deprecated
 	}
 )
 

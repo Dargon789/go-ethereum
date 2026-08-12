@@ -56,14 +56,13 @@ func (c Config) MarshalTOML() (interface{}, error) {
 		EnablePreimageRecording bool
 		EnableWitnessStats      bool
 		StatelessSelfValidation bool
-		EnableStateSizeTracking bool
 		SnapV2                  bool
 		VMTrace                 string
 		VMTraceJsonConfig       string
 		RPCGasCap               uint64
 		RPCEVMTimeout           time.Duration
 		RPCTxFeeCap             float64
-		EngineMaxReorgDepth     uint64        `toml:",omitempty"`
+		EngineMaxReorgDepth     uint64
 		OverrideOsaka           *uint64       `toml:",omitempty"`
 		OverrideAmsterdam       *uint64       `toml:",omitempty"`
 		OverrideBPO1            *uint64       `toml:",omitempty"`
@@ -113,7 +112,6 @@ func (c Config) MarshalTOML() (interface{}, error) {
 	enc.EnablePreimageRecording = c.EnablePreimageRecording
 	enc.EnableWitnessStats = c.EnableWitnessStats
 	enc.StatelessSelfValidation = c.StatelessSelfValidation
-	enc.EnableStateSizeTracking = c.EnableStateSizeTracking
 	enc.SnapV2 = c.SnapV2
 	enc.VMTrace = c.VMTrace
 	enc.VMTraceJsonConfig = c.VMTraceJsonConfig
@@ -174,14 +172,13 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		EnablePreimageRecording *bool
 		EnableWitnessStats      *bool
 		StatelessSelfValidation *bool
-		EnableStateSizeTracking *bool
 		SnapV2                  *bool
 		VMTrace                 *string
 		VMTraceJsonConfig       *string
 		RPCGasCap               *uint64
 		RPCEVMTimeout           *time.Duration
 		RPCTxFeeCap             *float64
-		EngineMaxReorgDepth     *uint64        `toml:",omitempty"`
+		EngineMaxReorgDepth     *uint64
 		OverrideOsaka           *uint64        `toml:",omitempty"`
 		OverrideAmsterdam       *uint64        `toml:",omitempty"`
 		OverrideBPO1            *uint64        `toml:",omitempty"`
@@ -311,9 +308,6 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	}
 	if dec.StatelessSelfValidation != nil {
 		c.StatelessSelfValidation = *dec.StatelessSelfValidation
-	}
-	if dec.EnableStateSizeTracking != nil {
-		c.EnableStateSizeTracking = *dec.EnableStateSizeTracking
 	}
 	if dec.SnapV2 != nil {
 		c.SnapV2 = *dec.SnapV2
