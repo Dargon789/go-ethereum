@@ -297,12 +297,6 @@ var (
 		Usage:    "Scheme to use for storing ethereum state ('hash' or 'path')",
 		Category: flags.StateCategory,
 	}
-	StateSizeTrackingFlag = &cli.BoolFlag{
-		Name:     "state.size-tracking",
-		Usage:    "Enable state size tracking, retrieve state size with debug_stateSize.",
-		Value:    ethconfig.Defaults.EnableStateSizeTracking,
-		Category: flags.StateCategory,
-	}
 	SnapV2Flag = &cli.BoolFlag{
 		Name:     "snap.v2",
 		Usage:    "Enable the experimental snap/2 (EIP-8189, BAL-based) sync protocol (advertises and syncs via snap/2; not safe on public networks)",
@@ -564,6 +558,12 @@ var (
 	MemoryLimitFlag = &cli.IntFlag{
 		Name:     "memorylimit",
 		Usage:    "Soft memory limit for the Go runtime in megabytes (default = no limit)",
+		Category: flags.PerfCategory,
+	}
+	GOGCFlag = &cli.IntFlag{
+		Name:     "gogc",
+		Usage:    "Go garbage collection target percentage (default = 50, negative disables)",
+		Value:    50,
 		Category: flags.PerfCategory,
 	}
 	CryptoKZGFlag = &cli.StringFlag{
@@ -1778,11 +1778,25 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 		}
 	}
 
-	godebug.SetGCPercent(100)
+	// Setting go runtime settings
+	gcPercent := ctx.Int(GOGCFlag.Name)
+	if ctx.IsSet(GOGCFlag.Name) {
+		log.Info("Sanitizing Go's GC trigger", "percent", gcPercent)
+	}
+	godebug.SetGCPercent(gcPercent)
+
 	if ctx.IsSet(MemoryLimitFlag.Name) {
 		memLimit := int64(ctx.Int(MemoryLimitFlag.Name)) * 1024 * 1024
-		log.Debug("Setting Go memory limit", "MB", memLimit/1024/1024)
-		godebug.SetMemoryLimit(memLimit)
+		if total > 0 && memLimit > int64(total) {
+			log.Info("Sanitizing memory limit", "provided(MB)", memLimit/1024/1024, "updated(MB)", total/1024/1024)
+			memLimit = int64(total)
+		}
+		if memLimit < 0 {
+			log.Warn("Ignoring negative Go memory limit")
+		} else {
+			log.Info("Setting Go memory limit", "MB", memLimit/1024/1024)
+			godebug.SetMemoryLimit(memLimit)
+		}
 	}
 
 	if ctx.IsSet(SyncTargetFlag.Name) {
@@ -1954,9 +1968,6 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 		} else {
 			cfg.EthDiscoveryURLs = SplitAndTrim(urls)
 		}
-	}
-	if ctx.IsSet(StateSizeTrackingFlag.Name) {
-		cfg.EnableStateSizeTracking = ctx.Bool(StateSizeTrackingFlag.Name)
 	}
 	if ctx.IsSet(SnapV2Flag.Name) {
 		cfg.SnapV2 = ctx.Bool(SnapV2Flag.Name)
@@ -2474,9 +2485,6 @@ func MakeChain(ctx *cli.Context, stack *node.Node, readonly bool) (*core.BlockCh
 		// - DATADIR/triedb/merkle.journal
 		// - DATADIR/triedb/verkle.journal
 		TrieJournalDirectory: stack.ResolvePath("triedb"),
-
-		// Enable state size tracking if enabled
-		StateSizeTracking: ctx.Bool(StateSizeTrackingFlag.Name),
 
 		// Configure the slow block statistic logger (disabled by default)
 		SlowBlockThreshold: ethconfig.Defaults.SlowBlockThreshold,

@@ -160,7 +160,7 @@ func testBlockChainImport(chain types.Blocks, blockchain *BlockChain) error {
 		if err != nil {
 			return err
 		}
-		res, err := blockchain.processor.Process(context.Background(), block, statedb, nil, vm.Config{})
+		res, err := blockchain.processor.Process(context.Background(), block, statedb, nil, nil, vm.Config{}, nil)
 		if err != nil {
 			blockchain.reportBadBlock(block, res, err)
 			return err
@@ -173,7 +173,7 @@ func testBlockChainImport(chain types.Blocks, blockchain *BlockChain) error {
 
 		blockchain.chainmu.MustLock()
 		rawdb.WriteBlock(blockchain.db, block)
-		statedb.Commit(block.NumberU64(), false, false)
+		statedb.Commit(params.Rules{}, block.NumberU64())
 		blockchain.chainmu.Unlock()
 	}
 	return nil
